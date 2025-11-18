@@ -1,0 +1,21 @@
+# Web Framework
+fastapi==0.121.1
+uvicorn[standard]==0.38.0
+
+# Database
+sqlalchemy==2.0.44
+#
+psycopg2-binary==2.9.9
+
+# Env Configuration
+python-dotenv==1.0.0
+
+
+requests==2.31.0
+
+
+pandas==2.3.3
+
+# Timezone Support
+pytz==2025.2
+python-dateutil==2.9.0.post0
