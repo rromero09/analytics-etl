@@ -1,0 +1,115 @@
+name: Monthly Sales ETL
+
+on:
+  schedule:
+    # Runs 1st of every month at 8:00 AM UTC (2-3 AM Chicago depending on DST)
+    - cron: '0 8 1 * *'
+  
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: 'Run mode'
+        required: true
+        type: choice
+        options:
+          - 'production'
+          - 'test'
+        default: 'production'
+      location_filter:
+        description: 'Location to process'
+        required: false
+        type: choice
+        options:
+          - 'all'
+          - '1'
+          - '2'
+          - '3'
+        default: 'all'
+      start_date:
+        description: 'Start date (YYYY-MM-DD) - empty = previous month'
+        required: false
+        type: string
+      end_date:
+        description: 'End date (YYYY-MM-DD) - empty = previous month'
+        required: false
+        type: string
+
+permissions:
+  id-token: write   # Required for AWS OIDC
+  contents: read
+
+jobs:
+  etl:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          # ============================================================  role-session-name: GitHubActions-RoscoeETL
+      
+
+      # TEST 1: Database Connection (Boolean Check)
+
+      - name: Test Database Connection
+        env:
+          ENVIRONMENT: production
+          PROD_DB_HOST: ${{ secrets.DB_HOST }}
+          PROD_DB_NAME: ${{ secrets.DB_NAME }}
+          PROD_DB_USER: ${{ secrets.DB_USER }}
+          PROD_DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          python -c "
+          import sys
+          from app.services.database_service import DatabaseService
+          
+          print('🔍 Testing database connection...')
+          db = DatabaseService()
+          
+          if db.test_connection():
+              print('✅ Database connection successful!')
+              sys.exit(0)
+          else:
+              print('❌ Database connection failed!')
+              sys.exit(1)
+          "
+      
+  
+      # TEST 2 / PRODUCTION: Run ETL (with test or production mode)
+
+      - name: Run Monthly ETL
+        env:
+          ENVIRONMENT: production
+          PROD_DB_HOST: ${{ secrets.DB_HOST }}
+          PROD_DB_NAME: ${{ secrets.DB_NAME }}
+          PROD_DB_USER: ${{ secrets.DB_USER }}
+          PROD_DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          SQUARE_ACCESS_TOKEN: ${{ secrets.SQUARE_ACCESS_TOKEN }}
+          LOG_LEVEL: INFO
+          TEST: ${{ github.event.inputs.run_mode == 'test' && 'true' || 'false' }}
+          LOCATION_FILTER: ${{ github.event.inputs.location_filter || 'all' }}
+          START_DATE: ${{ github.event.inputs.start_date || '' }}
+          END_DATE: ${{ github.event.inputs.end_date || '' }}
+        run: |
+          python -m app.scripts.monthly_etl
+      
+      - name: ETL Summary
+        if: success()
+        run: |
+          echo "✅ Monthly ETL completed successfully!"
+          echo "Check logs above for detailed statistics"
