@@ -68,7 +68,7 @@ jobs:
 
       - name: Test Database Connection
         env:
-          ENVIRONMENT: production
+          #ENVIRONMENT: production
           PROD_DB_HOST: ${{ secrets.DB_HOST }}
           PROD_DB_NAME: ${{ secrets.DB_NAME }}
           PROD_DB_USER: ${{ secrets.DB_USER }}
