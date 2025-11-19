@@ -160,19 +160,21 @@ class Config:
             )
     
     
-    def get_database_url(self) -> str:
-        """
-        Get PostgreSQL connection URL.
-        Returns:
-            str: PostgreSQL connection URL 
-        
-        """
-        
-        return (
-            f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@"
-            f"{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
-        )
+def get_database_url(self) -> str:
+    """
+    Get PostgreSQL connection URL.
+    Returns:
+        str: PostgreSQL connection URL with SSL for production
+    """
+    base_url = (
+        f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@"
+        f"{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+    )
     
+    # Add SSL requirement for production (AWS RDS requires it)
+    if self.is_production():
+        base_url += "?sslmode=require"
+    return base_url
     
     def is_development(self) -> bool:
         """Check if running in development mode."""

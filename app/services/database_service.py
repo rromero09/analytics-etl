@@ -122,7 +122,8 @@ class DatabaseService:
                 port=self.port,
                 database=self.database,
                 user=self.user,
-                password=self.password
+                password=self.password,
+                sslmode='require'  # Enforce SSL for security, also github and aws integration require it
             )
             logger.debug("Database connection established")
             yield conn
