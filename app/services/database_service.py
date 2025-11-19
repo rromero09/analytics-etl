@@ -28,7 +28,6 @@ import logging
 
 # Import our configuration utility
 from app.utils.config import config
-from app.services.database_service import test_connection
 
 
 # Configure logging
