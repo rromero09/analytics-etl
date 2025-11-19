@@ -82,12 +82,22 @@ class Config:
     
     
     def _load_production_database_config(self):
-        """Load production (AWS RDS) database configuration."""
-        self.DB_HOST = os.getenv('PROD_DB_HOST')
-        self.DB_PORT = int(os.getenv('PROD_DB_PORT', '5432'))
-        self.DB_NAME = os.getenv('PROD_DB_NAME')
-        self.DB_USER = os.getenv('PROD_DB_USER')
-        self.DB_PASSWORD = os.getenv('PROD_DB_PASSWORD')
+        """
+        Load production (AWS RDS) database configuration.
+        
+        Supports two naming conventions for flexibility:
+        1. Prefixed: PROD_DB_HOST, PROD_DB_NAME, etc. (local .env files)
+        2. Non-prefixed: DB_HOST, DB_NAME, etc. (GitHub Actions, simpler setup)
+        
+        Tries prefixed version first, falls back to non-prefixed.
+        This makes it compatible with both local development and CI/CD environments.
+        """
+        # Try PROD_* first, fall back to non-prefixed version
+        self.DB_HOST = os.getenv('PROD_DB_HOST') or os.getenv('DB_HOST')
+        self.DB_PORT = int(os.getenv('PROD_DB_PORT') or os.getenv('DB_PORT', '5432'))
+        self.DB_NAME = os.getenv('PROD_DB_NAME') or os.getenv('DB_NAME')
+        self.DB_USER = os.getenv('PROD_DB_USER') or os.getenv('DB_USER')
+        self.DB_PASSWORD = os.getenv('PROD_DB_PASSWORD') or os.getenv('DB_PASSWORD')
         
         # Validate required fields
         self._validate_database_config('PROD')
@@ -106,13 +116,13 @@ class Config:
         missing = []
         
         if not self.DB_HOST:
-            missing.append(f'{env}_DB_HOST')
+            missing.append(f'{env}_DB_HOST or DB_HOST')
         if not self.DB_NAME:
-            missing.append(f'{env}_DB_NAME')
+            missing.append(f'{env}_DB_NAME or DB_NAME')
         if not self.DB_USER:
-            missing.append(f'{env}_DB_USER')
+            missing.append(f'{env}_DB_USER or DB_USER')
         if not self.DB_PASSWORD:
-            missing.append(f'{env}_DB_PASSWORD')
+            missing.append(f'{env}_DB_PASSWORD or DB_PASSWORD')
         
         if missing:
             raise ValueError(
@@ -124,10 +134,10 @@ class Config:
     def _load_square_config(self):
         """Load Square API configuration."""
         self.SQUARE_ACCESS_TOKEN = os.getenv('SQUARE_ACCESS_TOKEN')
-           # ====================
-    # SQUARE API CONFIGURATION
-    # ====================
-
+        
+        # ====================
+        # SQUARE API CONFIGURATION
+        # ====================
         self.SQUARE_API_BASE_URL: str = "https://connect.squareup.com/v2"
         
         if not self.SQUARE_ACCESS_TOKEN:
@@ -249,4 +259,4 @@ if __name__ == "__main__":
         print("=" * 70)
         print(f"\n{str(e)}")
         print("=" * 70)
-        exit(1)     
+        exit(1)
