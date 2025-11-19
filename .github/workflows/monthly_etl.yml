@@ -73,6 +73,7 @@ jobs:
           PROD_DB_NAME: ${{ secrets.DB_NAME }}
           PROD_DB_USER: ${{ secrets.DB_USER }}
           PROD_DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          SQUARE_ACCESS_TOKEN: ${{ secrets.SQUARE_ACCESS_TOKEN }}
         run: |
           python -c "
           import sys
