@@ -173,7 +173,7 @@ def get_database_url(self) -> str:
     
     # Add SSL requirement for production (AWS RDS requires it)
     if self.is_production():
-        base_url += "?sslmode=require"
+        base_url += "?sslmode=require" 
     return base_url
     
     def is_development(self) -> bool:
