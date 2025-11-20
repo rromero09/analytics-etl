@@ -18,6 +18,7 @@ DESIGN PATTERN:
 import os
 from typing import Optional
 from dotenv import load_dotenv
+from urllib.parse import quote_plus 
 
 
 # Load environment variables from .env file
@@ -166,8 +167,10 @@ def get_database_url(self) -> str:
     Returns:
         str: PostgreSQL connection URL with SSL for production
     """
+    encoded_password = quote_plus(self.DB_PASSWORD)
+    
     base_url = (
-        f"postgresql://{self.DB_USER}:{self.DB_PASSWORD}@"
+        f"postgresql://{self.DB_USER}:{encoded_password}@"
         f"{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
     )
     
