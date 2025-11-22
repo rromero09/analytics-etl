@@ -59,7 +59,7 @@ class ETLService:
         sales_rows = etl_service.transform_order_to_sales(order, location_id=1)
     """
     
-    # Items to filter out (non-revenue items)
+    # Items to filter out from sales data
     IGNORED_ITEMS = [
         'dine in',
         'to go',
