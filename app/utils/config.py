@@ -2,12 +2,8 @@
 Configuration Management for Bakehouse-ETL
 
 This module loads environment variables and provides a centralized configuration, it
-it also  handles swithching between local and production modes based on the ENVIRONMENT variable.
-WHY THIS EXISTS:
-- Centralized configuration (Single Source of Truth)
-- Environment-based switching (dev vs prod)
-- Type validation and error handling
-- Prevents hardcoded values throughout the codebase
+it also  handles switching between local and production modes based on the ENVIRONMENT variable.
+
 
 DESIGN PATTERN:
 - Singleton-like behavior (one config instance for entire app)
