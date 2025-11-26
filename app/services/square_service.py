@@ -1,420 +1,404 @@
 """
-ETL Service for Bakehouse Sales Data
+Square Service for Bakehouse ETL
 
-Transforms Square API orders into database-ready sales records.
+Handles all Square API operations:
+- Authentication (multi-location token support)
+- Order fetching (single/multiple locations)
+- Date range queries
+- Connection testing
 
-Key jobs:
-- Transform Square JSON → sales table rows
-- Convert UTC timestamps → Chicago timezone
-- Extract date components (month, day_of_week)
-- Validate data before DB insertion
-- Filter out $0 items (Dine In, To Go, etc.)
-
-Critical details:
-- Uses order['closed_at'] NOT order['created_at']
-- Prices: cents → dollars (÷ 100)
-- All timestamps in America/Chicago timezone
-- Uses gross_sales_money (includes base + modifiers)
+Key features:
+- Location-specific API tokens (V1.1)
+- Automatic pagination
+- RFC3339 timestamp handling
+- Error handling with retries
 """
 
+import requests
 import datetime as dt
 from dateutil import tz
-from typing import Dict, List, Tuple, Optional
-from decimal import Decimal
+from typing import List, Dict, Tuple, Optional
 import logging
 
+from app.utils.config import config
+
+
+# Configure logging
 logger = logging.getLogger(__name__)
 
 
-class ETLValidationError(Exception):
-    """Custom exception for data validation errors."""
+class SquareAPIError(Exception):
+    """Custom exception for Square API errors."""
     pass
 
 
-class ETLService:
+class SquareService:
     """
-    Transforms Square API data into database-ready format.
+    Service for Square API interactions.
+    
+    Supports multiple locations with different API tokens due that each location
+    has its own token 
     
     Usage:
-        from app.services.etl_service import etl_service
-        sales_rows = etl_service.transform_order_to_sales(order, location_id=1)
+        from app.services.square_service import square_service
+        
+        # Fetch orders for location with specific token
+        orders = square_service.fetch_orders_by_date_range(
+            location_id="L5WST6KFZBT10",
+            location_db_id=2,  # Uses token for location 2
+            start_date="2025-11-01",
+            end_date="2025-11-30"
+        )
     """
     
-    # Filter these out from sales data
-    IGNORED_ITEMS = [
-        'dine in',
-        'to go',
-        'free water'
-    ]
-    
     def __init__(self):
-        """Initialize with Chicago timezone."""
-        self.chicago_tz = tz.gettz("America/Chicago")
-        logger.info("ETLService initialized with timezone: America/Chicago")
-    
-    
-    def convert_to_chicago_timezone(self, utc_timestamp: str) -> dt.datetime:
         """
-        Convert UTC timestamp to America/Chicago timezone.
+        Initialize Square service with default token and base URL.
         
-        Handles both RFC3339 and ISO 8601 formats from Square API.
-        Auto-handles CST/CDT (daylight saving time).
+        Location-specific tokens are loaded per-request from config.
+        """
+        self.base_url = "https://connect.squareup.com"
+        
+        # Default token (used as fallback)
+        self.access_token = config.SQUARE_ACCESS_TOKEN
+        
+        # Default headers (for connection testing)
+        self.headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        
+        logger.info(f"SquareService initialized with environment: {config.ENVIRONMENT}")
+        logger.info(f"Multi-location token support: ENABLED (V1.1)")
+    
+    
+    def _get_headers_for_location(self, location_db_id: int) -> Dict[str, str]:
+        """
+        Get API headers with the appropriate token for a location.
+        
+        Uses location-specific token if available, falls back to default.
         
         Args:
-            utc_timestamp: UTC timestamp string (e.g., "2025-11-07T13:27:45.163Z")
+            location_db_id: Database location ID (1, 2, or 3)
         
         Returns:
-            Datetime object in America/Chicago timezone
+            Headers dict with appropriate Authorization token
+        """
+        # Get token mapping from config
+        token_map = getattr(config, 'LOCATION_TOKEN_MAP', {})
+        
+        # Get location-specific token or fallback to default
+        token = token_map.get(location_db_id, self.access_token)
+        
+        if token_map.get(location_db_id):
+            logger.debug(f"Using location-specific token for location_db_id={location_db_id}")
+        else:
+            logger.debug(f"Using default token for location_db_id={location_db_id} (no specific token found)")
+        
+        return {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+    
+    
+    def day_window(
+        self, 
+        days_ago: int = 1, 
+        tzname: str = "America/Chicago"
+    ) -> Tuple[dt.datetime, dt.datetime, str, str]:
+        """
+        Generate time window for a specific day in local timezone.
+        
+        Returns both datetime objects and RFC3339 formatted strings.
+        
+        Args:
+            days_ago: Number of days in the past (0 = today, 1 = yesterday)
+            tzname: Timezone name (default: America/Chicago)
+        
+        Returns:
+            Tuple: (start_dt, end_dt, start_rfc3339, end_rfc3339)
+        """
+        local_tz = tz.gettz(tzname)
+        now_local = dt.datetime.now(local_tz)
+        
+        start = (now_local - dt.timedelta(days=days_ago)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        end = start + dt.timedelta(days=1)
+        
+        start_rfc = start.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        end_rfc = end.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        
+        logger.debug(f"Generated day window: {start_rfc} to {end_rfc}")
+        return start, end, start_rfc, end_rfc
+    
+    
+    def fetch_orders_by_date_range(
+        self,
+        location_id: str,
+        location_db_id: int,
+        start_date: str,
+        end_date: str,
+        state: str = "COMPLETED",
+        test: bool = False
+    ) -> List[Dict]:
+        """
+        Fetch orders for a specific location and date range.
+        
+        Uses location-specific API token based on location_db_id (V1.1).
+        
+        Args:
+            location_id: Square location ID (e.g., "L5WST6KFZBT10")
+            location_db_id: Database location ID (1, 2, or 3) - determines which token to use
+            start_date: Start date in 'YYYY-MM-DD' format
+            end_date: End date in 'YYYY-MM-DD' format
+            state: Order state to filter by (default: "COMPLETED")
+            test: If True, fetch max 2 pages (200 orders) for testing
+        
+        Returns:
+            List of order objects from Square API
         
         Raises:
-            ETLValidationError: If timestamp format is invalid
+            SquareAPIError: If API request fails
+            ValueError: If date format is invalid
         """
         try:
-            # Parse UTC timestamp (handle 'Z' suffix)
-            if utc_timestamp.endswith('Z'):
-                utc_timestamp = utc_timestamp[:-1] + '+00:00'
+            local_tz = tz.gettz("America/Chicago")
             
-            utc_dt = dt.datetime.fromisoformat(utc_timestamp)
-            chicago_dt = utc_dt.astimezone(self.chicago_tz)
+            # Parse dates
+            start_dt = dt.datetime.strptime(start_date, "%Y-%m-%d")
+            start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=local_tz)
             
-            logger.debug(f"Converted {utc_timestamp} → {chicago_dt}")
-            return chicago_dt
+            end_dt = dt.datetime.strptime(end_date, "%Y-%m-%d")
+            end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999, tzinfo=local_tz)
             
-        except (ValueError, AttributeError) as e:
-            error_msg = f"Invalid timestamp format: {utc_timestamp}"
-            logger.error(error_msg)
-            raise ETLValidationError(error_msg) from e
+            # Convert to RFC3339 UTC
+            start_rfc = start_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            end_rfc = end_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid date format. Expected 'YYYY-MM-DD', got start_date='{start_date}', end_date='{end_date}'"
+            ) from e
+        
+        # Get location-specific headers (V1.1)
+        headers = self._get_headers_for_location(location_db_id)
+        
+        logger.info(
+            f"Fetching orders for location {location_id} (db_id={location_db_id}) "
+            f"from {start_date} to {end_date}"
+            f"{' (TEST MODE - max 2 pages/200 orders)' if test else ''}"
+        )
+        logger.debug(f"RFC3339 range: {start_rfc} to {end_rfc}")
+        
+        url = f"{self.base_url}/v2/orders/search"
+        
+        orders = []
+        cursor = None
+        page_count = 0
+        max_pages = 2 if test else None
+        
+        while True:
+            page_count += 1
+            
+            # Stop if reached max pages (test mode)
+            if max_pages and page_count > max_pages:
+                logger.info(f"Reached max pages limit ({max_pages}), stopping")
+                break
+            
+            body = {
+                "location_ids": [location_id],
+                "query": {
+                    "filter": {
+                        "date_time_filter": {
+                            "closed_at": {
+                                "start_at": start_rfc,
+                                "end_at": end_rfc
+                            }
+                        },
+                        "state_filter": {
+                            "states": [state]
+                        }
+                    },
+                    "sort": {
+                        "sort_field": "CLOSED_AT",
+                        "sort_order": "ASC"
+                    }
+                },
+                "limit": 100
+            }
+            
+            if cursor:
+                body["cursor"] = cursor
+            
+            try:
+                logger.debug(f"Making POST request to {url} (page {page_count})")
+                response = requests.post(url, headers=headers, json=body)
+                response.raise_for_status()
+                
+                data = response.json()
+                page_orders = data.get("orders", [])
+                orders.extend(page_orders)
+                
+                logger.info(
+                    f"Fetched page {page_count} with {len(page_orders)} orders "
+                    f"(total: {len(orders)})"
+                )
+                
+                cursor = data.get("cursor")
+                
+                if not cursor:
+                    logger.info("No more pages, pagination complete")
+                    break
+                    
+            except requests.exceptions.HTTPError as e:
+                error_msg = f"Square API HTTP error: {e.response.status_code}"
+                try:
+                    error_data = e.response.json()
+                    error_msg += f" - {error_data}"
+                except:
+                    error_msg += f" - {e.response.text}"
+                
+                logger.error(error_msg)
+                raise SquareAPIError(error_msg) from e
+                
+            except requests.exceptions.RequestException as e:
+                error_msg = f"Square API request failed: {str(e)}"
+                logger.error(error_msg)
+                raise SquareAPIError(error_msg) from e
+        
+        logger.info(
+            f"Successfully fetched {len(orders)} orders for location {location_id} "
+            f"({start_date} to {end_date}) across {page_count} pages"
+        )
+        return orders
     
     
-    def extract_date_components(self, timestamp: dt.datetime) -> Tuple[str, str]:
+    def fetch_orders_by_date(
+        self,
+        location_id: str,
+        location_db_id: int,
+        days_ago: int = 0,
+        state: str = "COMPLETED",
+        test: bool = False
+    ) -> List[Dict]:
         """
-        Extract month and day_of_week from datetime.
+        Fetch orders for a specific location and date.
+        
+        Convenience wrapper around fetch_orders_by_date_range.
         
         Args:
-            timestamp: Timezone-aware datetime object
+            location_id: Square location ID
+            location_db_id: Database location ID (1, 2, or 3)
+            days_ago: Number of days in the past (0 = today, 1 = yesterday)
+            state: Order state to filter by (default: "COMPLETED")
+            test: If True, only fetch first 2 pages (for testing)
         
         Returns:
-            Tuple: (month as 'YYYY-MM', day_of_week as 'Monday')
+            List of order objects from Square API
         """
-        month = timestamp.strftime('%Y-%m')
-        day_of_week = timestamp.strftime('%A')  # Full day name
+        start_local, end_local, _, _ = self.day_window(days_ago)
         
-        logger.debug(f"Extracted: month={month}, day_of_week={day_of_week}")
-        return month, day_of_week
+        start_date = start_local.strftime('%Y-%m-%d')
+        end_date = (end_local - dt.timedelta(seconds=1)).strftime('%Y-%m-%d')
+        
+        return self.fetch_orders_by_date_range(
+            location_id=location_id,
+            location_db_id=location_db_id,
+            start_date=start_date,
+            end_date=end_date,
+            state=state,
+            test=test
+        )
     
     
-    def _is_valid_line_item(self, line_item: Dict) -> bool:
+    def fetch_multiple_locations(
+        self,
+        locations: List[Dict[str, any]],
+        days_ago: int = 0,
+        state: str = "COMPLETED",
+        test: bool = False
+    ) -> Dict[str, List[Dict]]:
         """
-        Check if line item should be processed.
-        
-        Filters out:
-        - Items with price = $0
-        - Items in IGNORED_ITEMS list (Dine In, To Go, etc.)
-        
-        Returns:
-            True if item should be processed
-        """
-        # Get price
-        base_price = line_item.get('base_price_money', {})
-        price_cents = base_price.get('amount', 0)
-        
-        # Filter $0 items
-        if price_cents <= 0:
-            item_name = line_item.get('name', 'UNKNOWN')
-            logger.debug(f"Filtering $0 item: {item_name}")
-            return False
-        
-        # Filter ignored items
-        item_name = line_item.get('name', '').lower()
-        for ignored_item in self.IGNORED_ITEMS:
-            if ignored_item in item_name:
-                logger.debug(f"Filtering ignored item: {line_item.get('name')}")
-                return False
-        
-        return True
-    
-    
-    def _parse_modifiers(self, line_item: Dict) -> str:
-        """
-        Extract revenue-generating modifier names from line item.
-        
-        Only includes modifiers with price > $0.
-        Filters out $0 modifiers like "To Go", "Flat White", etc.
+        Fetch orders for multiple locations for the same date.
         
         Args:
-            line_item: Line item dict from Square API
+            locations: List of location dicts with 'square_id' and 'id' (db_id)
+            days_ago: Number of days in the past
+            state: Order state to filter by
+            test: If True, only fetch first 2 pages per location
         
         Returns:
-            Comma-separated modifier names, or empty string
-            
-        Example:
-            Input: [{"name": "Almond Milk", "base_price_money": {"amount": 100}},
-                    {"name": "To Go", "base_price_money": {"amount": 0}}]
-            Output: "Almond Milk"
+            Dict mapping location square_id to list of orders
         """
-        modifiers_list = line_item.get('modifiers', [])
+        results = {}
         
-        if not modifiers_list:
-            return ""
-        
-        revenue_modifiers = []
-        
-        for modifier in modifiers_list:
-            # Get modifier price
-            price_cents = modifier.get('base_price_money', {}).get('amount', 0)
+        for location in locations:
+            square_id = location.get('square_id')
+            db_id = location.get('id')
             
-            # Only include revenue-generating modifiers (price > 0)
-            if price_cents > 0:
-                modifier_name = modifier.get('name', 'Unknown')
-                revenue_modifiers.append(modifier_name)
+            if not square_id or db_id is None:
+                logger.error(f"Invalid location dict: {location}")
+                continue
+            
+            try:
+                orders = self.fetch_orders_by_date(
+                    location_id=square_id,
+                    location_db_id=db_id,
+                    days_ago=days_ago,
+                    state=state,
+                    test=test
+                )
+                results[square_id] = orders
+                
+            except SquareAPIError as e:
+                logger.error(f"Failed to fetch orders for location {square_id}: {e}")
+                results[square_id] = []
         
-        # Join with commas
-        return ", ".join(revenue_modifiers) if revenue_modifiers else ""
+        return results
     
     
-    def validate_line_item(self, line_item: Dict) -> bool:
+    def test_connection(self, location_db_id: Optional[int] = None) -> bool:
         """
-        Validate line item has required fields.
+        Test Square API connection and authentication.
         
-        Checks:
-        - Has 'name', 'quantity', 'base_price_money.amount'
-        - Quantity is positive
-        - Price is non-negative
+        Args:
+            location_db_id: Optional location ID to test specific token
+                           If None, uses default token
+        
+        Returns:
+            True if connection successful
         """
         try:
-            # Check required fields exist
-            if not line_item.get('name'):
-                logger.warning("Line item missing 'name' field")
-                return False
+            # Use location-specific headers if provided
+            if location_db_id is not None:
+                headers = self._get_headers_for_location(location_db_id)
+                logger.info(f"Testing connection with token for location_db_id={location_db_id}")
+            else:
+                headers = self.headers
+                logger.info("Testing connection with default token")
             
-            if not line_item.get('quantity'):
-                logger.warning("Line item missing 'quantity' field")
-                return False
+            url = f"{self.base_url}/v2/locations"
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
             
-            base_price = line_item.get('base_price_money', {})
-            if 'amount' not in base_price:
-                logger.warning("Line item missing 'base_price_money.amount' field")
-                return False
+            locations = response.json().get("locations", [])
+            logger.info(f"Connection test successful. Found {len(locations)} locations.")
             
-            # Validate quantity is positive
-            qty = int(line_item['quantity'])
-            if qty <= 0:
-                logger.warning(f"Invalid quantity: {qty}")
-                return False
-            
-            # Validate price is non-negative
-            price_cents = int(base_price['amount'])
-            if price_cents < 0:
-                logger.warning(f"Invalid price: {price_cents}")
-                return False
+            for loc in locations:
+                logger.info(f"  - {loc.get('name')} (ID: {loc.get('id')})")
             
             return True
             
-        except (ValueError, TypeError, KeyError) as e:
-            logger.warning(f"Line item validation error: {e}")
+        except Exception as e:
+            logger.error(f"Connection test failed: {str(e)}")
             return False
-    
-    
-    def transform_order_to_sales(self, order: Dict, location_id: int) -> List[Dict]:
-        """
-        Transform a Square order into sales table rows.
-        
-        One order can have multiple line_items → each becomes a separate row.
-        Filters out $0 items and non-revenue items.
-        
-        Args:
-            order: Square order object from API
-            location_id: Database location_id (FK to locations table)
-        
-        Returns:
-            List of sales records ready for DB insertion
-        
-        Field mappings:
-            line_item.name                    → item_name
-            line_item.gross_sales_money       → sale_price (÷ 100, includes modifiers!)
-            line_item.quantity                → qty
-            order.closed_at                   → sale_timestamp
-            EXTRACT(month)                    → month
-            EXTRACT(day_of_week)              → day_of_week
-            line_item.variation_name or 'N/A' → item_category
-            location_id (parameter)           → location_id
-            line_item.modifiers (filtered)    → modifiers
-        
-        Raises:
-            ETLValidationError: If order missing critical fields
-        """
-        # Validate order has required fields
-        if 'closed_at' not in order:
-            error_msg = f"Order {order.get('id')} missing 'closed_at' field"
-            logger.error(error_msg)
-            raise ETLValidationError(error_msg)
-        
-        if 'line_items' not in order:
-            logger.warning(f"Order {order.get('id')} has no line_items, skipping")
-            return []
-        
-        # Convert timestamp to Chicago timezone
-        try:
-            chicago_timestamp = self.convert_to_chicago_timezone(order['closed_at'])
-        except ETLValidationError as e:
-            logger.error(f"Failed to convert timestamp for order {order.get('id')}: {e}")
-            raise
-        
-        # Extract date components
-        month, day_of_week = self.extract_date_components(chicago_timestamp)
-        
-        # Transform each line_item into a sales row
-        sales_rows = []
-        
-        for line_item in order['line_items']:
-            # Filter non-revenue items FIRST
-            if not self._is_valid_line_item(line_item):
-                continue
-            
-            # Validate line item structure
-            if not self.validate_line_item(line_item):
-                logger.warning(
-                    f"Skipping invalid line_item in order {order.get('id')}: "
-                    f"{line_item.get('name', 'UNKNOWN')}"
-                )
-                continue
-            
-            try:
-                # Extract basic fields
-                item_name = line_item['name']
-                qty = int(line_item['quantity'])
-                
-                # Extract modifiers (only revenue-generating ones)
-                modifiers = self._parse_modifiers(line_item)
-                
-                # Use gross_sales_money instead of base_price_money (includes modifiers!)
-                price_cents = int(line_item['gross_sales_money']['amount'])
-                sale_price = Decimal(price_cents) / Decimal(100)
-                
-                # Get category
-                item_category = line_item.get('variation_name', 'N/A')
-                
-                # Build sales record
-                sales_row = {
-                    'item_name': item_name,
-                    'sale_price': float(sale_price),  # Now includes modifiers!
-                    'qty': qty,
-                    'sale_timestamp': chicago_timestamp,
-                    'month': month,
-                    'day_of_week': day_of_week,
-                    'item_category': item_category,
-                    'location_id': location_id,
-                    'modifiers': modifiers  # NEW feature added to sales table
-                }
-                
-                sales_rows.append(sales_row)
-                
-                logger.debug(
-                    f"Transformed: {item_name} (${sale_price}, qty={qty}) "
-                    f"modifiers=[{modifiers}]"
-                )
-                
-            except (ValueError, KeyError, TypeError) as e:
-                logger.error(
-                    f"Error transforming line_item in order {order.get('id')}: {e}"
-                )
-                continue
-        
-        logger.info(
-            f"Order {order.get('id')}: "
-            f"{len(order['line_items'])} line_items → {len(sales_rows)} sales rows"
-        )
-        
-        return sales_rows
-    
-    
-    def transform_orders_batch(self, orders: List[Dict], location_id: int) -> List[Dict]:
-        """
-        Transform multiple orders into sales rows (batch operation).
-        
-        Args:
-            orders: List of Square order objects
-            location_id: Database location_id for all orders
-        
-        Returns:
-            Flattened list of all sales rows from all orders
-        """
-        all_sales_rows = []
-        failed_orders = 0
-        
-        for order in orders:
-            try:
-                sales_rows = self.transform_order_to_sales(order, location_id)
-                all_sales_rows.extend(sales_rows)
-                
-            except ETLValidationError as e:
-                logger.error(f"Failed to transform order {order.get('id')}: {e}")
-                failed_orders += 1
-                continue
-        
-        logger.info(
-            f"Batch done: {len(orders)} orders → {len(all_sales_rows)} sales rows "
-            f"({failed_orders} failed)"
-        )
-        
-        return all_sales_rows
-    
-    
-    def validate_sales_row(self, sales_row: Dict) -> bool:
-        """
-        Validate a sales row before DB insertion.
-        
-        Checks:
-        - All required fields present
-        - sale_price >= 0
-        - qty > 0
-        - sale_timestamp is datetime object
-        - month matches 'YYYY-MM' format
-        - day_of_week is valid day name
-        """
-        required_fields = [
-            'item_name', 'sale_price', 'qty', 'sale_timestamp',
-            'month', 'day_of_week', 'item_category', 'location_id',
-            'modifiers'  
-        ]
-        
-        # Check all required fields exist
-        for field in required_fields:
-            if field not in sales_row:
-                logger.warning(f"Missing required field: {field}")
-                return False
-        
-        # Validate price and quantity
-        if sales_row['sale_price'] < 0:
-            logger.warning(f"Invalid sale_price: {sales_row['sale_price']}")
-            return False
-        
-        if sales_row['qty'] <= 0:
-            logger.warning(f"Invalid qty: {sales_row['qty']}")
-            return False
-        
-        # Validate timestamp
-        if not isinstance(sales_row['sale_timestamp'], dt.datetime):
-            logger.warning(f"Invalid timestamp type: {type(sales_row['sale_timestamp'])}")
-            return False
-        
-        # Validate month format (YYYY-MM)
-        import re
-        if not re.match(r'^\d{4}-\d{2}$', sales_row['month']):
-            logger.warning(f"Invalid month format: {sales_row['month']}")
-            return False
-        
-        # Validate day_of_week
-        valid_days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-        if sales_row['day_of_week'] not in valid_days:
-            logger.warning(f"Invalid day_of_week: {sales_row['day_of_week']}")
-            return False
-        
-        return True
 
 
 # Singleton instance
-etl_service = ETLService()
+square_service = SquareService()
 
 
 # ============================================================================
@@ -423,129 +407,184 @@ etl_service = ETLService()
 
 if __name__ == "__main__":
     """
-    Test the ETL transformations.
+    Test Square service.
     
     Usage:
-        python app/services/etl_service.py
+        python app/services/square_service.py
     """
-    import json
     
-    print("=" * 70)
-    print("BAKEHOUSE ETL - SERVICE TEST")
-    print("=" * 70)
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
     
-    # Test 1: Timezone conversion
-    print("\n[TEST 1] Timezone conversion...")
-    utc_time = "2025-11-07T13:27:45.163Z"
-    chicago_time = etl_service.convert_to_chicago_timezone(utc_time)
-    print(f"UTC:     {utc_time}")
-    print(f"Chicago: {chicago_time}")
-    print(f"✅ Timezone: {chicago_time.tzname()}")
+    from datetime import timedelta
     
-    # Test 2: Date components
-    print("\n[TEST 2] Date component extraction...")
-    month, dow = etl_service.extract_date_components(chicago_time)
-    print(f"Month:       {month}")
-    print(f"Day of Week: {dow}")
-    print("✅ Extracted")
+    print("\n" + "#"*60)
+    print("# SQUARE SERVICE TEST SUITE (V1.1)")
+    print("#"*60)
     
-    # Test 3: Item filtering
-    print("\n[TEST 3] Item filtering...")
+    results = []
     
-    valid_item = {
-        "name": "Croissant Plain",
-        "base_price_money": {"amount": 500}
-    }
+    # =================================================================
+    # TEST 1: Connection Test (Default Token)
+    # =================================================================
+    print("\n" + "="*60)
+    print("TEST 1: Connection Test (Default Token)")
+    print("="*60)
     
-    dine_in = {
-        "name": "Dine In",
-        "base_price_money": {"amount": 0}
-    }
+    try:
+        result = square_service.test_connection()
+        if result:
+            print("✅ Default token connection PASSED")
+            results.append(("Connection Test (Default)", True))
+        else:
+            print("❌ Default token connection FAILED")
+            results.append(("Connection Test (Default)", False))
+    except Exception as e:
+        print(f"❌ Connection test ERROR: {e}")
+        results.append(("Connection Test (Default)", False))
     
-    print(f"Croissant: {etl_service._is_valid_line_item(valid_item)} ✅")
-    print(f"Dine In: {etl_service._is_valid_line_item(dine_in)} (should be False)")
+    # =================================================================
+    # TEST 2: Connection Test (Location-Specific Token)
+    # =================================================================
+    print("\n" + "="*60)
+    print("TEST 2: Connection Test (Location 2 Token)")
+    print("="*60)
     
-    # Test 4: Modifier parsing (NEW!)
-    print("\n[TEST 4] Modifier parsing (V1.1)...")
+    try:
+        result = square_service.test_connection(location_db_id=2)
+        if result:
+            print("✅ Location 2 token connection PASSED")
+            results.append(("Connection Test (Location 2)", True))
+        else:
+            print("❌ Location 2 token connection FAILED")
+            results.append(("Connection Test (Location 2)", False))
+    except Exception as e:
+        print(f"❌ Connection test ERROR: {e}")
+        results.append(("Connection Test (Location 2)", False))
     
-    line_item_with_modifiers = {
-        "name": "Iced Latte",
-        "modifiers": [
-            {
-                "name": "Almond Milk",
-                "base_price_money": {"amount": 100}
-            },
-            {
-                "name": "Extra Shot",
-                "base_price_money": {"amount": 75}
-            },
-            {
-                "name": "To Go",
-                "base_price_money": {"amount": 0}
-            }
-        ]
-    }
+    # =================================================================
+    # TEST 3: Fetch Orders with Location Token
+    # =================================================================
+    print("\n" + "="*60)
+    print("TEST 3: Fetch Orders with Location Token (Test Mode)")
+    print("="*60)
     
-    modifiers = etl_service._parse_modifiers(line_item_with_modifiers)
-    print(f"Modifiers extracted: '{modifiers}'")
-    print(f"✅ Filtered out $0 modifier (To Go)")
+    try:
+        # IMPORTANT: Replace with your actual location ID
+        location_id = "L5WST6KFZBT10"
+        location_db_id = 2  # Your current location
+        
+        orders = square_service.fetch_orders_by_date(
+            location_id=location_id,
+            location_db_id=location_db_id,
+            days_ago=0,
+            test=True
+        )
+        
+        print(f"✅ Fetched {len(orders)} orders using location-specific token")
+        
+        if orders:
+            print(f"\nSample order:")
+            print(f"  ID: {orders[0].get('id')}")
+            print(f"  Closed at: {orders[0].get('closed_at')}")
+            print(f"  Line items: {len(orders[0].get('line_items', []))}")
+        
+        print("✅ Location token fetch PASSED")
+        results.append(("Fetch with Location Token", True))
+            
+    except SquareAPIError as e:
+        print(f"❌ Square API error: {e}")
+        results.append(("Fetch with Location Token", False))
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        results.append(("Fetch with Location Token", False))
     
-    # Test 5: Order transformation with modifiers
-    print("\n[TEST 5] Order transformation with modifiers...")
+    # =================================================================
+    # TEST 4: Date Range with Location Token
+    # =================================================================
+    print("\n" + "="*60)
+    print("TEST 4: Fetch Date Range with Location Token")
+    print("="*60)
     
-    sample_order = {
-        "id": "test_order_v1.1",
-        "location_id": "L5WST6KFZBT10",
-        "closed_at": "2025-11-24T13:27:45.163Z",
-        "line_items": [
-            {
-                "name": "Iced Lavander latte",
-                "variation_name": "16 oz",
-                "quantity": "1",
-                "base_price_money": {"amount": 565, "currency": "USD"},
-                "gross_sales_money": {"amount": 665, "currency": "USD"},
-                "modifiers": [
-                    {
-                        "name": "Almond Milk",
-                        "base_price_money": {"amount": 100}
-                    }
-                ]
-            },
-            {
-                "name": "Dine In",
-                "variation_name": "N/A",
-                "quantity": "1",
-                "base_price_money": {"amount": 0, "currency": "USD"},
-                "gross_sales_money": {"amount": 0, "currency": "USD"}
-            }
-        ]
-    }
+    try:
+        location_id = "L5WST6KFZBT10"
+        location_db_id = 2
+        
+        end_date = dt.datetime.now().strftime('%Y-%m-%d')
+        start_date = (dt.datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        
+        orders = square_service.fetch_orders_by_date_range(
+            location_id=location_id,
+            location_db_id=location_db_id,
+            start_date=start_date,
+            end_date=end_date,
+            test=True
+        )
+        
+        print(f"✅ Fetched {len(orders)} orders from {start_date} to {end_date}")
+        print("✅ Date range with location token PASSED")
+        results.append(("Date Range with Token", True))
+        
+    except SquareAPIError as e:
+        print(f"❌ Square API error: {e}")
+        results.append(("Date Range with Token", False))
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        results.append(("Date Range with Token", False))
     
-    sales_rows = etl_service.transform_order_to_sales(sample_order, location_id=2)
+    # =================================================================
+    # TEST 5: Day Window Helper
+    # =================================================================
+    print("\n" + "="*60)
+    print("TEST 5: Day Window Helper")
+    print("="*60)
     
-    print(f"✅ Order with {len(sample_order['line_items'])} line_items → {len(sales_rows)} sales rows")
-    print(f"✅ Filtered out {len(sample_order['line_items']) - len(sales_rows)} items")
+    try:
+        start, end, start_rfc, end_rfc = square_service.day_window(days_ago=0)
+        
+        print(f"Today's window:")
+        print(f"  Local start: {start}")
+        print(f"  UTC start: {start_rfc}")
+        
+        duration = (end - start).total_seconds()
+        expected_duration = 24 * 60 * 60
+        
+        if duration == expected_duration:
+            print(f"✅ Window duration correct: {duration/3600} hours")
+            print("✅ Day window PASSED")
+            results.append(("Day Window Helper", True))
+        else:
+            print(f"❌ ERROR: Expected 24 hours, got {duration/3600} hours")
+            results.append(("Day Window Helper", False))
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        results.append(("Day Window Helper", False))
     
-    print("\n[TEST 6] Sample sales row with modifiers:")
-    print("-" * 70)
-    sample_row = {
-        **sales_rows[0],
-        'sale_timestamp': str(sales_rows[0]['sale_timestamp'])
-    }
-    print(json.dumps(sample_row, indent=2))
-    print("-" * 70)
-    print(f"✅ sale_price = $6.65 (base $5.65 + modifier $1.00)")
-    print(f"✅ modifiers = '{sales_rows[0]['modifiers']}'")
+    # =================================================================
+    # SUMMARY
+    # =================================================================
+    print("\n" + "="*60)
+    print("TEST SUMMARY (V1.1)")
+    print("="*60)
     
-    # Test 7: Validation
-    print("\n[TEST 7] Sales row validation...")
-    is_valid = etl_service.validate_sales_row(sales_rows[0])
-    if is_valid:
-        print("✅ Validation passed (includes 'modifiers' field)")
-    else:
-        print("❌ Validation failed")
+    passed = sum(1 for _, result in results if result)
+    total = len(results)
     
-    print("\n" + "=" * 70)
-    print("V1.1 Tests Complete! ✅")
-    print(f"IGNORED_ITEMS: {ETLService.IGNORED_ITEMS}")
-    print("=" * 70)
+    for test_name, result in results:
+        status = "✅ PASS" if result else "❌ FAIL"
+        print(f"{status} - {test_name}")
+    
+    print("="*60)
+    print(f"Results: {passed}/{total} tests passed")
+    print("="*60)
+    print("\nV1.1 Changes:")
+    print("  ✓ Added location_db_id parameter to fetch methods")
+    print("  ✓ Location-specific token support via _get_headers_for_location()")
+    print("  ✓ Fallback to default token if location token not found")
+    print("="*60)
+    
+    exit(0 if passed == total else 1)
