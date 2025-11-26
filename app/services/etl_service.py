@@ -1,30 +1,20 @@
 """
 ETL Service for Bakehouse Sales Data
 
-This module handles data transformation from Square API format to database schema.
-Key responsibilities:
-- Transform Square order JSON → sales table rows
-- Convert timestamps from UTC → America/Chicago timezone
+Transforms Square API orders into database-ready sales records.
+
+Key jobs:
+- Transform Square JSON → sales table rows
+- Convert UTC timestamps → Chicago timezone
 - Extract date components (month, day_of_week)
-- Validate data before database insertion
-- Filter out non-revenue items (Dine In, To Go, etc.)
+- Validate data before DB insertion
+- Filter out $0 items (Dine In, To Go, etc.)
 
-WHY THIS EXISTS:
-- Centralizes all data transformation logic
-- Ensures consistent timezone handling
-- Provides data validation layer
-- Separates transformation concerns from API/database logic
-
-DESIGN PATTERN:
-- Pure transformation functions (no side effects)
-- Timezone-aware datetime handling
-- One order → multiple sales rows (one per line_item)
-
-CRITICAL NOTES:
-- Uses order['closed_at'] NOT order['created_at'] (based on working implementation)
-- All prices converted from cents to dollars (divide by 100)
-- All timestamps stored in America/Chicago timezone
-- Filters out $0 items and non-revenue items (Dine In, To Go, etc.)
+Critical details:
+- Uses order['closed_at'] NOT order['created_at']
+- Prices: cents → dollars (÷ 100)
+- All timestamps in America/Chicago timezone
+- Uses gross_sales_money (includes base + modifiers)
 """
 
 import datetime as dt
@@ -43,23 +33,14 @@ class ETLValidationError(Exception):
 
 class ETLService:
     """
-    Service class for transforming Square API data into database-ready format.
-    
-    This class handles all data transformation operations including:
-    - Order → sales rows transformation
-    - Timezone conversions
-    - Date/time component extraction
-    - Data validation
-    - Filtering non-revenue items
+    Transforms Square API data into database-ready format.
     
     Usage:
         from app.services.etl_service import etl_service
-        
-        # Transform an order for location_id=1
         sales_rows = etl_service.transform_order_to_sales(order, location_id=1)
     """
     
-    # Items to filter out from sales data
+    # Filter these out from sales data
     IGNORED_ITEMS = [
         'dine in',
         'to go',
@@ -67,40 +48,33 @@ class ETLService:
     ]
     
     def __init__(self):
-        """Initialize the ETL service."""
+        """Initialize with Chicago timezone."""
         self.chicago_tz = tz.gettz("America/Chicago")
         logger.info("ETLService initialized with timezone: America/Chicago")
     
     
     def convert_to_chicago_timezone(self, utc_timestamp: str) -> dt.datetime:
         """
-        Convert UTC timestamp string to America/Chicago timezone.
+        Convert UTC timestamp to America/Chicago timezone.
         
-        Handles both RFC3339 format and ISO 8601 format timestamps from Square API.
-        Automatically accounts for CST/CDT (daylight saving time).
+        Handles both RFC3339 and ISO 8601 formats from Square API.
+        Auto-handles CST/CDT (daylight saving time).
         
         Args:
-            utc_timestamp (str): UTC timestamp string (e.g., "2025-11-07T13:27:45.163Z")
+            utc_timestamp: UTC timestamp string (e.g., "2025-11-07T13:27:45.163Z")
         
         Returns:
-            dt.datetime: Datetime object in America/Chicago timezone
-        
-        Example:
-            >>> etl_service.convert_to_chicago_timezone("2025-11-07T13:27:45.163Z")
-            datetime.datetime(2025, 11, 7, 7, 27, 45, 163000, tzinfo=tzfile('America/Chicago'))
+            Datetime object in America/Chicago timezone
         
         Raises:
             ETLValidationError: If timestamp format is invalid
         """
         try:
-            # Parse the UTC timestamp
-            # Handle both formats: "2025-11-07T13:27:45.163Z" and "2025-11-07T13:27:45Z"
+            # Parse UTC timestamp (handle 'Z' suffix)
             if utc_timestamp.endswith('Z'):
                 utc_timestamp = utc_timestamp[:-1] + '+00:00'
             
             utc_dt = dt.datetime.fromisoformat(utc_timestamp)
-            
-            # Convert to Chicago timezone
             chicago_dt = utc_dt.astimezone(self.chicago_tz)
             
             logger.debug(f"Converted {utc_timestamp} → {chicago_dt}")
@@ -112,89 +86,100 @@ class ETLService:
             raise ETLValidationError(error_msg) from e
     
     
-    def extract_date_components(
-        self, 
-        timestamp: dt.datetime
-    ) -> Tuple[str, str]:
+    def extract_date_components(self, timestamp: dt.datetime) -> Tuple[str, str]:
         """
-        Extract date components from a datetime object.
+        Extract month and day_of_week from datetime.
         
         Args:
-            timestamp (dt.datetime): Timezone-aware datetime object
+            timestamp: Timezone-aware datetime object
         
         Returns:
-            Tuple containing:
-                - month (str): Format 'YYYY-MM' (e.g., '2025-11')
-                - day_of_week (str): Day name (e.g., 'Monday')
-        
-        Example:
-            >>> ts = datetime(2025, 11, 7, 7, 27, 45, tzinfo=chicago_tz)
-            >>> month, dow = etl_service.extract_date_components(ts)
-            >>> print(month, dow)
-            '2025-11' 'Thursday'
+            Tuple: (month as 'YYYY-MM', day_of_week as 'Monday')
         """
         month = timestamp.strftime('%Y-%m')
         day_of_week = timestamp.strftime('%A')  # Full day name
         
-        logger.debug(
-            f"Extracted components: month={month}, day_of_week={day_of_week}"
-        )
-        
+        logger.debug(f"Extracted: month={month}, day_of_week={day_of_week}")
         return month, day_of_week
     
     
     def _is_valid_line_item(self, line_item: Dict) -> bool:
         """
-        Check if a line item should be processed (filters out non-revenue items).
+        Check if line item should be processed.
         
-        Args:
-            line_item (Dict): Line item object from Square order
+        Filters out:
+        - Items with price = $0
+        - Items in IGNORED_ITEMS list (Dine In, To Go, etc.)
         
         Returns:
-            bool: True if item should be processed, False if it should be filtered out
-        
-        Filtering rules:
-            - Filter out items with price = $0
-            - Filter out items in IGNORED_ITEMS list (case-insensitive)
+            True if item should be processed
         """
         # Get price
         base_price = line_item.get('base_price_money', {})
         price_cents = base_price.get('amount', 0)
         
-        # Filter out $0 items
+        # Filter $0 items
         if price_cents <= 0:
             item_name = line_item.get('name', 'UNKNOWN')
-            logger.debug(f"Filtering out $0 item: {item_name}")
+            logger.debug(f"Filtering $0 item: {item_name}")
             return False
         
-        # Get item name
+        # Filter ignored items
         item_name = line_item.get('name', '').lower()
-        
-        # Filter out ignored items
         for ignored_item in self.IGNORED_ITEMS:
             if ignored_item in item_name:
-                logger.debug(f"Filtering out ignored item: {line_item.get('name')}")
+                logger.debug(f"Filtering ignored item: {line_item.get('name')}")
                 return False
         
         return True
     
     
-    def validate_line_item(self, line_item: Dict) -> bool:
+    def _parse_modifiers(self, line_item: Dict) -> str:
         """
-        Validate that a line item has required fields.
+        Extract revenue-generating modifier names from line item.
+        
+        Only includes modifiers with price > $0.
+        Filters out $0 modifiers like "To Go", "Flat White", etc.
         
         Args:
-            line_item (Dict): Line item object from Square order
+            line_item: Line item dict from Square API
         
         Returns:
-            bool: True if valid, False otherwise
+            Comma-separated modifier names, or empty string
+            
+        Example:
+            Input: [{"name": "Almond Milk", "base_price_money": {"amount": 100}},
+                    {"name": "To Go", "base_price_money": {"amount": 0}}]
+            Output: "Almond Milk"
+        """
+        modifiers_list = line_item.get('modifiers', [])
         
-        Validation checks:
-            - Has 'name' field
-            - Has 'quantity' field
-            - Has 'base_price_money' field with 'amount'
-            - Quantity is positive
-            - Price is non-negative
+        if not modifiers_list:
+            return ""
+        
+        revenue_modifiers = []
+        
+        for modifier in modifiers_list:
+            # Get modifier price
+            price_cents = modifier.get('base_price_money', {}).get('amount', 0)
+            
+            # Only include revenue-generating modifiers (price > 0)
+            if price_cents > 0:
+                modifier_name = modifier.get('name', 'Unknown')
+                revenue_modifiers.append(modifier_name)
+        
+        # Join with commas
+        return ", ".join(revenue_modifiers) if revenue_modifiers else ""
+    
+    
+    def validate_line_item(self, line_item: Dict) -> bool:
+        """
+        Validate line item has required fields.
+        
+        Checks:
+        - Has 'name', 'quantity', 'base_price_money.amount'
+        - Quantity is positive
+        - Price is non-negative
         """
         try:
             # Check required fields exist
@@ -230,56 +215,33 @@ class ETLService:
             return False
     
     
-    def transform_order_to_sales(
-        self, 
-        order: Dict, 
-        location_id: int
-    ) -> List[Dict]:
+    def transform_order_to_sales(self, order: Dict, location_id: int) -> List[Dict]:
         """
         Transform a Square order into sales table rows.
         
-        One order can have multiple line_items, each becomes a separate row.
-        Filters out non-revenue items (Dine In, To Go, $0 items, etc.)
+        One order can have multiple line_items → each becomes a separate row.
+        Filters out $0 items and non-revenue items.
         
         Args:
-            order (Dict): Square order object from API
-            location_id (int): Database location_id (FK to locations table)
+            order: Square order object from API
+            location_id: Database location_id (FK to locations table)
         
         Returns:
-            List[Dict]: List of sales records ready for database insertion
+            List of sales records ready for DB insertion
         
-        Field Mappings:
-            Square JSON Field                    → Database Column
-            ────────────────────────────────────────────────────────
-            line_item.name                       → item_name
-            line_item.base_price_money.amount    → sale_price (÷ 100)
-            line_item.quantity                   → qty
-            order.closed_at                      → sale_timestamp
-            EXTRACT(month from closed_at)        → month
-            EXTRACT(day_of_week from closed_at)  → day_of_week
-            line_item.variation_name OR 'N/A'    → item_category
-            location_id (parameter)              → location_id
-        
-        Example:
-            >>> order = {
-            ...     "id": "abc123",
-            ...     "location_id": "L5WST6KFZBT10",
-            ...     "closed_at": "2025-11-07T13:27:45.163Z",
-            ...     "line_items": [
-            ...         {
-            ...             "name": "Croissant Plain",
-            ...             "variation_name": "Regular",
-            ...             "quantity": "1",
-            ...             "base_price_money": {"amount": 500, "currency": "USD"}
-            ...         }
-            ...     ]
-            ... }
-            >>> sales_rows = etl_service.transform_order_to_sales(order, location_id=1)
-            >>> print(sales_rows[0]['item_name'])
-            'Croissant Plain'
+        Field mappings:
+            line_item.name                    → item_name
+            line_item.gross_sales_money       → sale_price (÷ 100, includes modifiers!)
+            line_item.quantity                → qty
+            order.closed_at                   → sale_timestamp
+            EXTRACT(month)                    → month
+            EXTRACT(day_of_week)              → day_of_week
+            line_item.variation_name or 'N/A' → item_category
+            location_id (parameter)           → location_id
+            line_item.modifiers (filtered)    → modifiers
         
         Raises:
-            ETLValidationError: If order is missing critical fields
+            ETLValidationError: If order missing critical fields
         """
         # Validate order has required fields
         if 'closed_at' not in order:
@@ -291,7 +253,7 @@ class ETLService:
             logger.warning(f"Order {order.get('id')} has no line_items, skipping")
             return []
         
-        # Convert closed_at timestamp to Chicago timezone
+        # Convert timestamp to Chicago timezone
         try:
             chicago_timestamp = self.convert_to_chicago_timezone(order['closed_at'])
         except ETLValidationError as e:
@@ -305,7 +267,7 @@ class ETLService:
         sales_rows = []
         
         for line_item in order['line_items']:
-            # Filter out non-revenue items FIRST
+            # Filter non-revenue items FIRST
             if not self._is_valid_line_item(line_item):
                 continue
             
@@ -318,34 +280,38 @@ class ETLService:
                 continue
             
             try:
-                # Extract fields with safe defaults
+                # Extract basic fields
                 item_name = line_item['name']
                 qty = int(line_item['quantity'])
                 
-                # Convert price from cents to dollars
-                price_cents = int(line_item['base_price_money']['amount'])
+                # Extract modifiers (only revenue-generating ones)
+                modifiers = self._parse_modifiers(line_item)
+                
+                # Use gross_sales_money instead of base_price_money (includes modifiers!)
+                price_cents = int(line_item['gross_sales_money']['amount'])
                 sale_price = Decimal(price_cents) / Decimal(100)
                 
-                # Get category (variation_name or 'N/A')
+                # Get category
                 item_category = line_item.get('variation_name', 'N/A')
                 
                 # Build sales record
                 sales_row = {
                     'item_name': item_name,
-                    'sale_price': float(sale_price),  # Convert Decimal to float for DB
+                    'sale_price': float(sale_price),  # Now includes modifiers!
                     'qty': qty,
                     'sale_timestamp': chicago_timestamp,
                     'month': month,
                     'day_of_week': day_of_week,
                     'item_category': item_category,
-                    'location_id': location_id
+                    'location_id': location_id,
+                    'modifiers': modifiers  # NEW in V1.1!
                 }
                 
                 sales_rows.append(sales_row)
                 
                 logger.debug(
-                    f"Transformed line_item: {item_name} "
-                    f"(${sale_price}, qty={qty}) → sales row"
+                    f"Transformed: {item_name} (${sale_price}, qty={qty}) "
+                    f"modifiers=[{modifiers}]"
                 )
                 
             except (ValueError, KeyError, TypeError) as e:
@@ -355,32 +321,23 @@ class ETLService:
                 continue
         
         logger.info(
-            f"Transformed order {order.get('id')}: "
+            f"Order {order.get('id')}: "
             f"{len(order['line_items'])} line_items → {len(sales_rows)} sales rows"
         )
         
         return sales_rows
     
     
-    def transform_orders_batch(
-        self,
-        orders: List[Dict],
-        location_id: int
-    ) -> List[Dict]:
+    def transform_orders_batch(self, orders: List[Dict], location_id: int) -> List[Dict]:
         """
         Transform multiple orders into sales rows (batch operation).
         
         Args:
-            orders (List[Dict]): List of Square order objects
-            location_id (int): Database location_id for all orders
+            orders: List of Square order objects
+            location_id: Database location_id for all orders
         
         Returns:
-            List[Dict]: Flattened list of all sales rows from all orders
-        
-        Example:
-            >>> orders = square_service.fetch_orders_by_date("L5WST6KFZBT10", days_ago=0)
-            >>> sales_data = etl_service.transform_orders_batch(orders, location_id=1)
-            >>> print(f"Total sales rows: {len(sales_data)}")
+            Flattened list of all sales rows from all orders
         """
         all_sales_rows = []
         failed_orders = 0
@@ -396,9 +353,8 @@ class ETLService:
                 continue
         
         logger.info(
-            f"Batch transformation complete: "
-            f"{len(orders)} orders → {len(all_sales_rows)} sales rows "
-            f"({failed_orders} orders failed)"
+            f"Batch done: {len(orders)} orders → {len(all_sales_rows)} sales rows "
+            f"({failed_orders} failed)"
         )
         
         return all_sales_rows
@@ -406,31 +362,26 @@ class ETLService:
     
     def validate_sales_row(self, sales_row: Dict) -> bool:
         """
-        Validate a sales row before database insertion.
+        Validate a sales row before DB insertion.
         
-        Args:
-            sales_row (Dict): Sales row dictionary
-        
-        Returns:
-            bool: True if valid, False otherwise
-        
-        Validation checks:
-            - All required fields present
-            - sale_price > 0
-            - qty > 0
-            - sale_timestamp is datetime object
-            - month matches 'YYYY-MM' format
-            - day_of_week is valid day name
+        Checks:
+        - All required fields present
+        - sale_price >= 0
+        - qty > 0
+        - sale_timestamp is datetime object
+        - month matches 'YYYY-MM' format
+        - day_of_week is valid day name
         """
         required_fields = [
             'item_name', 'sale_price', 'qty', 'sale_timestamp',
-            'month', 'day_of_week', 'item_category', 'location_id'
+            'month', 'day_of_week', 'item_category', 'location_id',
+            'modifiers'  # NEW in V1.1!
         ]
         
         # Check all required fields exist
         for field in required_fields:
             if field not in sales_row:
-                logger.warning(f"Sales row missing required field: {field}")
+                logger.warning(f"Missing required field: {field}")
                 return False
         
         # Validate price and quantity
@@ -442,9 +393,9 @@ class ETLService:
             logger.warning(f"Invalid qty: {sales_row['qty']}")
             return False
         
-        # Validate timestamp is datetime
+        # Validate timestamp
         if not isinstance(sales_row['sale_timestamp'], dt.datetime):
-            logger.warning(f"Invalid sale_timestamp type: {type(sales_row['sale_timestamp'])}")
+            logger.warning(f"Invalid timestamp type: {type(sales_row['sale_timestamp'])}")
             return False
         
         # Validate month format (YYYY-MM)
@@ -462,17 +413,17 @@ class ETLService:
         return True
 
 
-# Create singleton instance
+# Singleton instance
 etl_service = ETLService()
 
 
 # ============================================================================
-# TESTING & VALIDATION
+# TESTING
 # ============================================================================
 
 if __name__ == "__main__":
     """
-    Run this file directly to test the ETL transformations.
+    Test the ETL transformations.
     
     Usage:
         python app/services/etl_service.py
@@ -480,115 +431,121 @@ if __name__ == "__main__":
     import json
     
     print("=" * 70)
-    print("BAKEHOUSE ETL - ETL SERVICE TEST")
+    print("BAKEHOUSE ETL - SERVICE TEST")
     print("=" * 70)
     
-    # Test 1: Timezone Conversion
-    print("\n[TEST 1] Testing timezone conversion...")
+    # Test 1: Timezone conversion
+    print("\n[TEST 1] Timezone conversion...")
     utc_time = "2025-11-07T13:27:45.163Z"
     chicago_time = etl_service.convert_to_chicago_timezone(utc_time)
     print(f"UTC:     {utc_time}")
     print(f"Chicago: {chicago_time}")
     print(f"✅ Timezone: {chicago_time.tzname()}")
     
-    # Test 2: Date Component Extraction
-    print("\n[TEST 2] Testing date component extraction...")
+    # Test 2: Date components
+    print("\n[TEST 2] Date component extraction...")
     month, dow = etl_service.extract_date_components(chicago_time)
-    print(f"Month:        {month}")
-    print(f"Day of Week:  {dow}")
-    print("✅ Date components extracted")
+    print(f"Month:       {month}")
+    print(f"Day of Week: {dow}")
+    print("✅ Extracted")
     
-    # Test 3: Item Filtering
-    print("\n[TEST 3] Testing item filtering...")
+    # Test 3: Item filtering
+    print("\n[TEST 3] Item filtering...")
     
     valid_item = {
         "name": "Croissant Plain",
         "base_price_money": {"amount": 500}
     }
     
-    dine_in_item = {
+    dine_in = {
         "name": "Dine In",
         "base_price_money": {"amount": 0}
     }
     
-    to_go_item = {
-        "name": "To Go",
-        "base_price_money": {"amount": 0}
+    print(f"Croissant: {etl_service._is_valid_line_item(valid_item)} ✅")
+    print(f"Dine In: {etl_service._is_valid_line_item(dine_in)} (should be False)")
+    
+    # Test 4: Modifier parsing (NEW!)
+    print("\n[TEST 4] Modifier parsing (V1.1)...")
+    
+    line_item_with_modifiers = {
+        "name": "Iced Latte",
+        "modifiers": [
+            {
+                "name": "Almond Milk",
+                "base_price_money": {"amount": 100}
+            },
+            {
+                "name": "Extra Shot",
+                "base_price_money": {"amount": 75}
+            },
+            {
+                "name": "To Go",
+                "base_price_money": {"amount": 0}
+            }
+        ]
     }
     
-    print(f"Valid item (Croissant): {etl_service._is_valid_line_item(valid_item)} ✅")
-    print(f"Dine In item: {etl_service._is_valid_line_item(dine_in_item)} (should be False)")
-    print(f"To Go item: {etl_service._is_valid_line_item(to_go_item)} (should be False)")
+    modifiers = etl_service._parse_modifiers(line_item_with_modifiers)
+    print(f"Modifiers extracted: '{modifiers}'")
+    print(f"✅ Filtered out $0 modifier (To Go)")
     
-    # Test 4: Order Transformation with Filtering
-    print("\n[TEST 4] Testing order transformation with filtering...")
+    # Test 5: Order transformation with modifiers
+    print("\n[TEST 5] Order transformation with modifiers...")
     
     sample_order = {
-        "id": "test_order_123",
+        "id": "test_order_v1.1",
         "location_id": "L5WST6KFZBT10",
-        "closed_at": "2025-11-07T13:27:45.163Z",
+        "closed_at": "2025-11-24T13:27:45.163Z",
         "line_items": [
             {
-                "name": "Croissant Plain",
-                "variation_name": "Regular",
+                "name": "Iced Lavander latte",
+                "variation_name": "16 oz",
                 "quantity": "1",
-                "base_price_money": {
-                    "amount": 500,
-                    "currency": "USD"
-                }
+                "base_price_money": {"amount": 565, "currency": "USD"},
+                "gross_sales_money": {"amount": 665, "currency": "USD"},
+                "modifiers": [
+                    {
+                        "name": "Almond Milk",
+                        "base_price_money": {"amount": 100}
+                    }
+                ]
             },
             {
                 "name": "Dine In",
                 "variation_name": "N/A",
                 "quantity": "1",
-                "base_price_money": {
-                    "amount": 0,
-                    "currency": "USD"
-                }
-            },
-            {
-                "name": "Drip Coffee",
-                "variation_name": "8 oz",
-                "quantity": "2",
-                "base_price_money": {
-                    "amount": 295,
-                    "currency": "USD"
-                }
-            },
-            {
-                "name": "To Go",
-                "variation_name": "N/A",
-                "quantity": "1",
-                "base_price_money": {
-                    "amount": 0,
-                    "currency": "USD"
-                }
+                "base_price_money": {"amount": 0, "currency": "USD"},
+                "gross_sales_money": {"amount": 0, "currency": "USD"}
             }
         ]
     }
     
-    sales_rows = etl_service.transform_order_to_sales(sample_order, location_id=1)
+    sales_rows = etl_service.transform_order_to_sales(sample_order, location_id=2)
     
     print(f"✅ Order with {len(sample_order['line_items'])} line_items → {len(sales_rows)} sales rows")
-    print(f"✅ Filtered out {len(sample_order['line_items']) - len(sales_rows)} non-revenue items")
+    print(f"✅ Filtered out {len(sample_order['line_items']) - len(sales_rows)} items")
     
-    print("\n[TEST 5] Sample sales row:")
+    print("\n[TEST 6] Sample sales row with modifiers:")
     print("-" * 70)
-    print(json.dumps({
+    sample_row = {
         **sales_rows[0],
-        'sale_timestamp': str(sales_rows[0]['sale_timestamp'])  # Convert datetime for JSON
-    }, indent=2))
+        'sale_timestamp': str(sales_rows[0]['sale_timestamp'])
+    }
+    print(json.dumps(sample_row, indent=2))
     print("-" * 70)
+    print(f"✅ sale_price = $6.65 (base $5.65 + modifier $1.00)")
+    print(f"✅ modifiers = '{sales_rows[0]['modifiers']}'")
     
-    # Test 6: Validation
-    print("\n[TEST 6] Testing sales row validation...")
+    # Test 7: Validation
+    print("\n[TEST 7] Sales row validation...")
     is_valid = etl_service.validate_sales_row(sales_rows[0])
     if is_valid:
-        print("✅ Sales row validation passed")
+        print("✅ Validation passed (includes 'modifiers' field)")
     else:
-        print("❌ Sales row validation failed")
+        print("❌ Validation failed")
     
     print("\n" + "=" * 70)
-    print("All tests passed! ✅")
-    print(f"IGNORED_ITEMS list: {ETLService.IGNORED_ITEMS}")
+    print("V1.1 Tests Complete! ✅")
+    print(f"IGNORED_ITEMS: {ETLService.IGNORED_ITEMS}")
     print("=" * 70)

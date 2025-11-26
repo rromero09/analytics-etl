@@ -1,18 +1,19 @@
 """
 Monthly ETL Script - Orchestrates the complete ETL pipeline
-"""
 
+V1.1 Changes:
+- Passes location_db_id to Square service for multi-token support
+"""
 import os
 import sys
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 import logging
 
-# Import our services
+# Import services
 from app.services.square_service import square_service, SquareAPIError
 from app.services.etl_service import etl_service, ETLValidationError
 from app.services.database_service import DatabaseService
-
 
 # Configure logging
 logging.basicConfig(
@@ -21,19 +22,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Reduce verbosity for service loggers (only show warnings and errors)
+# Reduce service logger verbosity (only warnings/errors)
 logging.getLogger('app.services.etl_service').setLevel(logging.WARNING)
 logging.getLogger('app.services.square_service').setLevel(logging.WARNING)
 logging.getLogger('app.services.database_service').setLevel(logging.INFO)
 
 
 class MonthlyETL:
-    """
-    Orchestrates the monthly ETL process.
-    """
+    """Orchestrates the monthly ETL process."""
     
     def __init__(self):
-        """Initialize the ETL orchestrator with all required services."""
+        """Initialize ETL orchestrator with services."""
         self.square_service = square_service
         self.etl_service = etl_service
         self.db_service = DatabaseService()
@@ -47,15 +46,15 @@ class MonthlyETL:
             'end_time': None
         }
         
-        logger.info("MonthlyETL initialized")
+        logger.info("MonthlyETL initialized (V1.1)")
     
     
     def calculate_previous_month(self) -> Tuple[str, str]:
-        """Calculate the start and end dates for the previous month."""
+        """Calculate start and end dates for previous month."""
         today = datetime.now()
-        first_of_current_month = today.replace(day=1) #today is the first day of current month
-        last_day_of_previous_month = first_of_current_month - timedelta(days=1) #time delta of 1 day
-        first_day_of_previous_month = last_day_of_previous_month.replace(day=1)# replace is a literal day of the month
+        first_of_current_month = today.replace(day=1)
+        last_day_of_previous_month = first_of_current_month - timedelta(days=1)
+        first_day_of_previous_month = last_day_of_previous_month.replace(day=1)
         
         start_date = first_day_of_previous_month.strftime('%Y-%m-%d')
         end_date = last_day_of_previous_month.strftime('%Y-%m-%d')
@@ -65,7 +64,7 @@ class MonthlyETL:
     
     
     def get_date_range_from_env(self) -> Tuple[str, str]:
-        """Get date range from environment variables or calculate previous month."""
+        """Get date range from env vars or calculate previous month."""
         start_date = os.getenv('START_DATE')
         end_date = os.getenv('END_DATE')
         
@@ -80,11 +79,9 @@ class MonthlyETL:
     
     
     def get_locations_to_process(self) -> List[Dict]:
-        """Get the list of locations to process based on LOCATION_FILTER env var."""
+        """Get list of locations to process."""
         all_locations = self.db_service.get_all_locations()
-   
         return all_locations
-    
     
     
     def is_test_mode(self) -> bool:
@@ -93,7 +90,7 @@ class MonthlyETL:
         is_test = test_mode in ['true', '1', 'yes']
         
         if is_test:
-            logger.info("⚠️  TEST MODE ENABLED - 5 orders per location")
+            logger.info("⚠️  TEST MODE ENABLED - max 2 pages (200 orders) per location")
         
         return is_test
     
@@ -107,11 +104,10 @@ class MonthlyETL:
     ) -> Dict:
         """Process ETL for a single location."""
         location_name = location['name']
-        location_id = location['id']
-        square_id = location['square_id']
+        location_id = location['id']  # Database location ID
+        square_id = location['square_id']  # Square location ID
         
         print(f"Processing: {location_name}")
-     
         
         result = {
             'location_name': location_name,
@@ -123,10 +119,11 @@ class MonthlyETL:
         }
         
         try:
-            # Fetch orders
+            # Fetch orders (V1.1: pass location_db_id for token selection)
             print(f"[1/3] Fetching orders from Square API...")
             orders = self.square_service.fetch_orders_by_date_range(
                 location_id=square_id,
+                location_db_id=location_id,  # NEW in V1.1! Used to select correct token
                 start_date=start_date,
                 end_date=end_date,
                 test=test_mode
@@ -191,7 +188,7 @@ class MonthlyETL:
         self.stats['start_time'] = datetime.now()
         
         print("\n" + "#"*60)
-        print("# MONTHLY ETL PROCESS")
+        print("# MONTHLY ETL PROCESS (V1.1)")
         print("#"*60)
         
         # Test database connection
@@ -220,7 +217,7 @@ class MonthlyETL:
         print(f"Locations: {len(locations)}")
         for loc in locations:
             print(f"  - {loc['name']} (ID: {loc['id']})")
-        print(f"Test mode: {'YES (5 orders)' if test_mode else 'NO (full)'}")
+        print(f"Test mode: {'YES (2 pages max)' if test_mode else 'NO (full)'}")
         print("="*60)
         
         # Process each location

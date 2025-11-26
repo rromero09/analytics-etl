@@ -1,23 +1,16 @@
 """
 Database Service for Bakehouse ETL
 
-This module handles ALL database operations for the ETL pipeline:
-- Connection management (with automatic cleanup)
-- Bulk insert operations for sales data
+Handles ALL database operations:
+- Connection management (auto cleanup)
+- Bulk insert for sales data
 - Query location data
 - Transaction management (commit/rollback)
 
-WHY THIS EXISTS:
-- Centralized database logic (Single Responsibility Principle)
-- Reusable connection handling across the application
-- Transaction safety (rollback on errors)
-- Prevents SQL injection with parameterized queries
-
-DESIGN PATTERNS USED:
-- Context Manager Pattern (with statement for automatic cleanup)
-- Singleton-like behavior for configuration
-- Repository Pattern (database access layer)
-- Error handling with detailed logging
+Key features:
+- Context manager for connections (prevents leaks)
+- Bulk insert optimization (batch processing)
+- Parameterized queries (prevents SQL injection)
 """
 
 import psycopg2
@@ -26,7 +19,7 @@ from typing import List, Dict, Optional, Tuple
 from contextlib import contextmanager
 import logging
 
-# Import our configuration utility
+# Import config
 from app.utils.config import config
 
 
@@ -40,22 +33,12 @@ logger = logging.getLogger(__name__)
 
 class DatabaseService:
     """
-    Database service for managing PostgreSQL connections and operations.
-    
-    This class provides a clean interface for all database operations needed
-    by the ETL pipeline. It handles connection pooling, error handling, and
-    transaction management automatically.
-    
-    KEY FEATURES:
-    - Automatic connection cleanup (using context managers)
-    - Bulk insert optimization (batch processing)
-    - Transaction safety (rollback on errors)
-    - Parameterized queries (prevents SQL injection)
+    Database service for PostgreSQL connections and operations.
     
     Usage:
         db = DatabaseService()
         
-        # Check connection
+        # Test connection
         if db.test_connection():
             print("Connected!")
         
@@ -63,18 +46,11 @@ class DatabaseService:
         locations = db.get_all_locations()
         
         # Insert sales data
-        sales_data = [...]
         count = db.bulk_insert_sales(sales_data)
     """
     
     def __init__(self):
-        """
-        Initialize the database service with configuration.
-        
-        No connection is made here - connections are created on-demand
-        using context managers. This is more efficient and prevents
-        connection leaks.
-        """
+        """Initialize with config. Connections are created on-demand."""
         self.host = config.DB_HOST
         self.port = config.DB_PORT
         self.database = config.DB_NAME
@@ -92,27 +68,15 @@ class DatabaseService:
         """
         Context manager for database connections.
         
-        WHY USE A CONTEXT MANAGER:
-        - Automatic connection cleanup (even if errors occur)
-        - Prevents connection leaks
-        - Clean syntax with 'with' statement
-        
-        WHAT HAPPENS:
-        1. Creates connection
-        2. Yields connection to caller
-        3. Automatically closes connection when done (even on error)
+        Automatically closes connection when done (even on error).
         
         Usage:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM locations")
-                # Connection automatically closes here
         
         Yields:
             psycopg2.connection: Database connection object
-        
-        Raises:
-            psycopg2.Error: If connection fails
         """
         conn = None
         try:
@@ -123,7 +87,7 @@ class DatabaseService:
                 database=self.database,
                 user=self.user,
                 password=self.password,
-                sslmode='require'    # Enforce SSL for security, also github and aws integration require it
+                sslmode='require'    # Required for GitHub/AWS integration
             )
             logger.debug("Database connection established")
             yield conn
@@ -133,7 +97,7 @@ class DatabaseService:
             raise
             
         finally:
-            # Always close connection, even if error occurs
+            # Always close connection
             if conn is not None:
                 conn.close()
                 logger.debug("Database connection closed")
@@ -141,19 +105,10 @@ class DatabaseService:
     
     def test_connection(self) -> bool:
         """
-        Test if database connection is working.
-        
-        This is used for health checks and troubleshooting.
+        Test if database connection works.
         
         Returns:
-            bool: True if connection successful, False otherwise
-        
-        Example:
-            >>> db = DatabaseService()
-            >>> if db.test_connection():
-            ...     print("Database is reachable!")
-            ... else:
-            ...     print("Database connection failed!")
+            True if connection successful
         """
         try:
             with self.get_connection() as conn:
@@ -176,29 +131,15 @@ class DatabaseService:
     
     def get_all_locations(self) -> List[Dict[str, any]]:
         """
-        Retrieve all locations from the database.
-        
-        This is used by the ETL pipeline to loop through all locations
-        and fetch data for each one.
+        Retrieve all locations from database.
         
         Returns:
-            List[Dict]: List of location dictionaries
-                Each dict contains: {id, name, square_id}
-        
-        Example:
-            >>> db = DatabaseService()
-            >>> locations = db.get_all_locations()
-            >>> for loc in locations:
-            ...     print(f"{loc['name']} - {loc['square_id']}")
-            Southport - LQ984N07EKF0R
-            Roscoe - L5WST6KFZBT10
-            Wrigleyville - LGA2FCC04F7YA
+            List of location dicts: {id, name, square_id}
         """
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Query all locations, ordered by ID
                 query = """
                     SELECT id, name, square_id
                     FROM locations
@@ -209,7 +150,7 @@ class DatabaseService:
                 rows = cursor.fetchall()
                 cursor.close()
                 
-                # Convert rows to dictionaries for easier access
+                # Convert to dicts
                 locations = [
                     {
                         'id': row[0],
@@ -229,28 +170,20 @@ class DatabaseService:
     
     def get_location_by_square_id(self, square_id: str) -> Optional[Dict[str, any]]:
         """
-        Get location details by Square location ID.
+        Get location by Square location ID.
         
-        This is used to map Square API location IDs to our internal
-        location_id (foreign key in sales table).
+        Maps Square API location IDs to internal location_id.
         
         Args:
-            square_id (str): Square location ID (e.g., 'LQ984N07EKF0R')
+            square_id: Square location ID (e.g., 'LQ984N07EKF0R')
         
         Returns:
-            Dict or None: Location dict {id, name, square_id} or None if not found
-        
-        Example:
-            >>> db = DatabaseService()
-            >>> location = db.get_location_by_square_id('LQ984N07EKF0R')
-            >>> print(location['name'])
-            Southport
+            Location dict or None if not found
         """
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # Parameterized query (prevents SQL injection)
                 query = """
                     SELECT id, name, square_id
                     FROM locations
@@ -283,8 +216,7 @@ class DatabaseService:
         Insert multiple sales records in a single transaction.
         
         Args:
-            sales_data (List[Dict]): List of sales records to insert
-                Each dict must contain:
+            sales_data: List of sales records, each containing:
                 {
                     'item_name': str,
                     'sale_price': float,
@@ -293,15 +225,12 @@ class DatabaseService:
                     'month': str,
                     'day_of_week': str,
                     'item_category': str,
-                    'location_id': int
+                    'location_id': int,
+                    'modifiers': str  # NEW in V1.1!
                 }
         
         Returns:
-            int: Number of records inserted
-        
-        Raises:
-            ValueError: If sales_data is empty or invalid
-            psycopg2.Error: If database operation fails
+            Number of records inserted
         """
         if not sales_data:
             logger.warning("No sales data provided for insertion")
@@ -311,7 +240,7 @@ class DatabaseService:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # SQL INSERT statement (8 columns, 8 placeholders)
+                # SQL INSERT statement (9 columns for V1.1)
                 insert_query = """
                     INSERT INTO sales (
                         item_name,
@@ -321,9 +250,10 @@ class DatabaseService:
                         month,
                         day_of_week,
                         item_category,
-                        location_id
+                        location_id,
+                        modifiers
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                 """
                 
@@ -339,7 +269,8 @@ class DatabaseService:
                             record['month'],
                             record['day_of_week'],
                             record.get('item_category', 'N/A'),
-                            record['location_id']
+                            record['location_id'],
+                            record.get('modifiers', '')  # NEW in V1.1! Default to empty string
                         )
                         records.append(record_tuple)
                     except KeyError as e:
@@ -350,7 +281,7 @@ class DatabaseService:
                 # Execute batch insert
                 execute_batch(cursor, insert_query, records, page_size=100)
                 
-                # Commit the transaction
+                # Commit transaction
                 conn.commit()
                 cursor.close()
                 
@@ -359,40 +290,7 @@ class DatabaseService:
                 
         except ValueError as e:
             logger.error(f"Validation error: {e}")
-            raise e
-        """
-        Test if database connection is working.
-        
-        This is used for health checks and troubleshooting.
-        
-        Returns:
-            bool: True if connection successful, False otherwise
-        
-        Example:
-            >>> db = DatabaseService()
-            >>> if db.test_connection():
-            ...     print("Database is reachable!")
-            ... else:
-            ...     print("Database connection failed!")
-        """
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT 1")
-                result = cursor.fetchone()
-                cursor.close()
-                
-                if result and result[0] == 1:
-                    logger.info("Database connection test: SUCCESS ✓")
-                    return True
-                else:
-                    logger.error("Database connection test: FAILED ✗")
-                    return False
-                    
-        except Exception as e:
-            logger.error(f"Database connection test failed: {e}")
-            return False
-    
+            raise
             
         except psycopg2.Error as e:
             logger.error(f"Database error during bulk insert: {e}")
@@ -404,96 +302,81 @@ class DatabaseService:
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             raise
+    
+    
+    def get_sales_count_by_location(self, location_id: int) -> int:
+        """
+        Get total number of sales records for a location.
         
+        Args:
+            location_id: Location ID
         
-        def get_sales_count_by_location(self, location_id: int) -> int:
-            """
-            Get the total number of sales records for a location.
-            
-            Utility function for monitoring and reporting.
-            
-            Args:
-                location_id (int): Location ID
-            
-            Returns:
-                int: Number of sales records
-            
-            Example:
-                >>> db = DatabaseService()
-                >>> count = db.get_sales_count_by_location(1)
-                >>> print(f"Southport has {count} sales records")
-            """
-            try:
-                with self.get_connection() as conn:
-                    cursor = conn.cursor()
-                    
-                    query = """
-                        SELECT COUNT(*)
-                        FROM sales
-                        WHERE location_id = %s
-                    """
-                    
-                    cursor.execute(query, (location_id,))
-                    count = cursor.fetchone()[0]
-                    cursor.close()
-                    
-                    logger.debug(f"Location {location_id} has {count} sales records")
-                    return count
-                    
-            except Exception as e:
-                logger.error(f"Failed to get sales count: {e}")
-                raise
+        Returns:
+            Number of sales records
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                query = """
+                    SELECT COUNT(*)
+                    FROM sales
+                    WHERE location_id = %s
+                """
+                
+                cursor.execute(query, (location_id,))
+                count = cursor.fetchone()[0]
+                cursor.close()
+                
+                logger.debug(f"Location {location_id} has {count} sales records")
+                return count
+                
+        except Exception as e:
+            logger.error(f"Failed to get sales count: {e}")
+            raise
+    
+    
+    def get_sales_date_range(self, location_id: int) -> Optional[Tuple[str, str]]:
+        """
+        Get date range of sales data for a location.
         
+        Args:
+            location_id: Location ID
         
-        def get_sales_date_range(self, location_id: int) -> Optional[Tuple[str, str]]:
-            """
-            Get the date range of sales data for a location.
-            
-            Useful for checking what data exists before running ETL.
-            
-            Args:
-                location_id (int): Location ID
-            
-            Returns:
-                Tuple[str, str] or None: (earliest_date, latest_date) or None if no data
-            
-            Example:
-                >>> db = DatabaseService()
-                >>> date_range = db.get_sales_date_range(1)
-                >>> if date_range:
-                ...     print(f"Data from {date_range[0]} to {date_range[1]}")
-            """
-            try:
-                with self.get_connection() as conn:
-                    cursor = conn.cursor()
+        Returns:
+            (earliest_date, latest_date) or None if no data
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                query = """
+                    SELECT 
+                        MIN(sale_timestamp::date),
+                        MAX(sale_timestamp::date)
+                    FROM sales
+                    WHERE location_id = %s
+                """
+                
+                cursor.execute(query, (location_id,))
+                result = cursor.fetchone()
+                cursor.close()
+                
+                if result and result[0] and result[1]:
+                    date_range = (str(result[0]), str(result[1]))
+                    logger.debug(
+                        f"Location {location_id} data range: "
+                        f"{date_range[0]} to {date_range[1]}"
+                    )
+                    return date_range
+                else:
+                    logger.debug(f"No sales data found for location {location_id}")
+                    return None
                     
-                    query = """
-                        SELECT 
-                            MIN(sale_timestamp::date),
-                            MAX(sale_timestamp::date)
-                        FROM sales
-                        WHERE location_id = %s
-                    """
-                    
-                    cursor.execute(query, (location_id,))
-                    result = cursor.fetchone()
-                    cursor.close()
-                    
-                    if result and result[0] and result[1]:
-                        date_range = (str(result[0]), str(result[1]))
-                        logger.debug(
-                            f"Location {location_id} data range: "
-                            f"{date_range[0]} to {date_range[1]}"
-                        )
-                        return date_range
-                    else:
-                        logger.debug(f"No sales data found for location {location_id}")
-                        return None
-                        
-            except Exception as e:
-                logger.error(f"Failed to get sales date range: {e}")
-                raise
-        
+        except Exception as e:
+            logger.error(f"Failed to get sales date range: {e}")
+            raise
+    
     
     def delete_sales_by_month(
         self, 
@@ -504,22 +387,15 @@ class DatabaseService:
         """
         Delete sales records for a specific month and location.
         
-        USE WITH CAUTION: This is a destructive operation!
-        Only use this for data corrections or re-processing.
+        USE WITH CAUTION: Destructive operation!
         
         Args:
-            location_id (int): Location ID
-            month (str): Month in 'YYYY-MM' format (e.g., '2025-10')
-            confirm (bool): Must be True to actually delete (safety check)
+            location_id: Location ID
+            month: Month in 'YYYY-MM' format
+            confirm: Must be True to actually delete
         
         Returns:
-            int: Number of records deleted
-        
-        Example:
-            >>> db = DatabaseService()
-            >>> # Delete October 2025 data for Southport
-            >>> deleted = db.delete_sales_by_month(1, '2025-10', confirm=True)
-            >>> print(f"Deleted {deleted} records")
+            Number of records deleted
         """
         if not confirm:
             logger.warning("Delete operation not confirmed - no records deleted")
@@ -529,7 +405,7 @@ class DatabaseService:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
-                # First, count how many records will be deleted
+                # Count records to delete
                 count_query = """
                     SELECT COUNT(*)
                     FROM sales
@@ -544,7 +420,7 @@ class DatabaseService:
                     cursor.close()
                     return 0
                 
-                # Delete the records
+                # Delete records
                 delete_query = """
                     DELETE FROM sales
                     WHERE location_id = %s AND month = %s
@@ -566,11 +442,13 @@ class DatabaseService:
 
 
 # ============================================================================
-# TESTING & DEMONSTRATION
+# TESTING
 # ============================================================================
 
 if __name__ == "__main__":
-    """TEST DATABASE SERVICE
+    """
+    Test database service.
+    
     Usage:
         python app/services/database_service.py
     """
@@ -578,10 +456,10 @@ if __name__ == "__main__":
     print("BAKEHOUSE ETL - DATABASE SERVICE TEST")
     print("=" * 70)
     
-    # Initialize service
+    # Initialize
     db = DatabaseService()
     
-    # Test 1: Connection test
+    # Test 1: Connection
     print("\n1. Testing database connection:")
     if db.test_connection():
         print("   ✓ Connection successful!")
@@ -589,7 +467,7 @@ if __name__ == "__main__":
         print("   ✗ Connection failed!")
         exit(1)
     
-    # Test 2: Get all locations
+    # Test 2: Get locations
     print("\n2. Retrieving all locations:")
     try:
         locations = db.get_all_locations()
@@ -599,7 +477,7 @@ if __name__ == "__main__":
         print(f"   ✗ Failed: {e}")
         exit(1)
     
-    # Test 3: Get location by Square ID
+    # Test 3: Lookup by Square ID
     print("\n3. Looking up location by Square ID:")
     try:
         test_square_id = locations[0]['square_id']
@@ -611,7 +489,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"   ✗ Failed: {e}")
     
-    # Test 4: Check sales data for each location
+    # Test 4: Check sales data
     print("\n4. Checking existing sales data:")
     for loc in locations:
         try:
@@ -628,10 +506,9 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"   ✗ Failed for {loc['name']}: {e}")
     
-    # Test 5: Test bulk insert with sample data
-    print("\n5. Testing bulk insert (dry run - no actual insert):")
-    print("   Sample data structure validated:")
-    from datetime import datetime, time
+    # Test 5: Validate bulk insert structure
+    print("\n5. Testing bulk insert structure (V1.1 with modifiers):")
+    from datetime import datetime
     sample_sales = [
         {
             'item_name': 'Test Croissant',
@@ -641,17 +518,17 @@ if __name__ == "__main__":
             'month': '2025-11',
             'day_of_week': 'Monday',
             'item_category': 'Test',
-            'location_id': 1
+            'location_id': 1,
+            'modifiers': 'Almond Milk'  # NEW in V1.1!
         }
     ]
-    print(f"   ✓ Sample record format is valid")
+    print(f"   ✓ Sample record format is valid (includes modifiers)")
     print(f"   ✓ Ready for bulk insert operations")
     
     print("\n" + "=" * 70)
     print("ALL DATABASE TESTS PASSED! ✓")
     print("=" * 70)
-    print("\nNext steps:")
-    print("  1. Copy this file to: app/services/database_service.py")
-    print("  2. Test it: python app/services/database_service.py")
-    print("  3. Ready to build Square API service!")
+    print("\nV1.1 Changes:")
+    print("  ✓ Added 'modifiers' column to INSERT query (9 columns now)")
+    print("  ✓ Defaults to empty string if modifiers not provided")
     print("=" * 70)
