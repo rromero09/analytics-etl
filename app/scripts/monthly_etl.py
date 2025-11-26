@@ -79,8 +79,28 @@ class MonthlyETL:
     
     
     def get_locations_to_process(self) -> List[Dict]:
-        """Get list of locations to process."""
+        """Get list of locations to process based on LOCATION_FILTER env var."""
         all_locations = self.db_service.get_all_locations()
+        
+        # Check for location filter
+        location_filter = os.getenv('LOCATION_FILTER')
+        
+        if location_filter:
+            try:
+                filter_id = int(location_filter)
+                filtered = [loc for loc in all_locations if loc['id'] == filter_id]
+                
+                if filtered:
+                    logger.info(f"LOCATION_FILTER={filter_id} applied - processing only: {filtered[0]['name']}")
+                    return filtered
+                else:
+                    logger.warning(f"LOCATION_FILTER={filter_id} not found, processing all locations")
+                    return all_locations
+                    
+            except ValueError:
+                logger.warning(f"Invalid LOCATION_FILTER value: {location_filter}, processing all locations")
+                return all_locations
+        
         return all_locations
     
     

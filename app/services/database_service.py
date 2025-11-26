@@ -215,6 +215,8 @@ class DatabaseService:
         """
         Insert multiple sales records in a single transaction.
         
+        Includes retry logic for transient SSL/network errors.
+        
         Args:
             sales_data: List of sales records, each containing:
                 {
@@ -236,72 +238,104 @@ class DatabaseService:
             logger.warning("No sales data provided for insertion")
             return 0
         
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                # SQL INSERT statement (9 columns for V1.1)
-                insert_query = """
-                    INSERT INTO sales (
-                        item_name,
-                        sale_price,
-                        qty,
-                        sale_timestamp,
-                        month,
-                        day_of_week,
-                        item_category,
-                        location_id,
-                        modifiers
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s
-                    )
-                """
-                
-                # Convert list of dicts to list of tuples
-                records = []
-                for record in sales_data:
-                    try:
-                        record_tuple = (
-                            record['item_name'],
-                            record['sale_price'],
-                            record['qty'],
-                            record['sale_timestamp'],
-                            record['month'],
-                            record['day_of_week'],
-                            record.get('item_category', 'N/A'),
-                            record['location_id'],
-                            record.get('modifiers', '')  # NEW in V1.1! Default to empty string
+        # Retry logic for transient errors
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    
+                    # SQL INSERT statement (9 columns for V1.1)
+                    insert_query = """
+                        INSERT INTO sales (
+                            item_name,
+                            sale_price,
+                            qty,
+                            sale_timestamp,
+                            month,
+                            day_of_week,
+                            item_category,
+                            location_id,
+                            modifiers
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s
                         )
-                        records.append(record_tuple)
-                    except KeyError as e:
-                        logger.error(f"Missing required field in sales record: {e}")
-                        logger.error(f"Record: {record}")
-                        raise ValueError(f"Invalid sales data format: missing field {e}")
+                    """
+                    
+                    # Convert list of dicts to list of tuples
+                    records = []
+                    for record in sales_data:
+                        try:
+                            record_tuple = (
+                                record['item_name'],
+                                record['sale_price'],
+                                record['qty'],
+                                record['sale_timestamp'],
+                                record['month'],
+                                record['day_of_week'],
+                                record.get('item_category', 'N/A'),
+                                record['location_id'],
+                                record.get('modifiers', '')  # NEW in V1.1! Default to empty string
+                            )
+                            records.append(record_tuple)
+                        except KeyError as e:
+                            logger.error(f"Missing required field in sales record: {e}")
+                            logger.error(f"Record: {record}")
+                            raise ValueError(f"Invalid sales data format: missing field {e}")
+                    
+                    # Execute batch insert with smaller page size for large datasets
+                    page_size = 50 if len(records) > 1000 else 100
+                    execute_batch(cursor, insert_query, records, page_size=page_size)
+                    
+                    # Commit transaction
+                    conn.commit()
+                    cursor.close()
+                    
+                    logger.info(f"Successfully inserted {len(records)} sales records")
+                    return len(records)
+                    
+            except ValueError as e:
+                # Don't retry validation errors
+                logger.error(f"Validation error: {e}")
+                raise
                 
-                # Execute batch insert
-                execute_batch(cursor, insert_query, records, page_size=100)
+            except psycopg2.OperationalError as e:
+                error_msg = str(e).lower()
                 
-                # Commit transaction
-                conn.commit()
-                cursor.close()
+                # Check if it's a transient SSL/network error
+                if 'ssl' in error_msg or 'connection' in error_msg or 'timeout' in error_msg:
+                    if attempt < max_retries:
+                        logger.warning(
+                            f"Transient error on attempt {attempt}/{max_retries}: {e}. "
+                            f"Retrying in {retry_delay}s..."
+                        )
+                        import time
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        logger.error(f"Failed after {max_retries} attempts: {e}")
+                        raise
+                else:
+                    # Non-transient operational error
+                    logger.error(f"Database operational error: {e}")
+                    raise
                 
-                logger.info(f"Successfully inserted {len(records)} sales records")
-                return len(records)
+            except psycopg2.Error as e:
+                logger.error(f"Database error during bulk insert: {e}")
+                raise
                 
-        except ValueError as e:
-            logger.error(f"Validation error: {e}")
-            raise
-            
-        except psycopg2.Error as e:
-            logger.error(f"Database error during bulk insert: {e}")
-            raise
-            
-        except Exception as e:
-            logger.error(f"Unexpected error during bulk insert: {e}")
-            logger.error(f"Error type: {type(e).__name__}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise
+            except Exception as e:
+                logger.error(f"Unexpected error during bulk insert: {e}")
+                logger.error(f"Error type: {type(e).__name__}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                raise
+        
+        # Should never reach here, but just in case
+        raise Exception(f"Failed to insert sales data after {max_retries} attempts")
     
     
     def get_sales_count_by_location(self, location_id: int) -> int:
