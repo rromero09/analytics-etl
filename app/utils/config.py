@@ -1,5 +1,5 @@
 """
-Configuration Management for Bakehouse-ETL
+Configuration Management for ETL Application
 
 Loads environment variables and provides centralized config.
 Handles local vs production modes based on ENVIRONMENT variable.
@@ -7,7 +7,7 @@ Handles local vs production modes based on ENVIRONMENT variable.
 Design:
 - Singleton-like (one config instance for entire app)
 - Fail-fast validation (errors on startup, not during execution)
-- Multi-location token support (V1.1)
+- Multi-location token support
 """
 
 import os
@@ -32,7 +32,7 @@ class Config:
         
         print(config.DB_HOST)
         print(config.SQUARE_ACCESS_TOKEN)
-        print(config.LOCATION_TOKEN_MAP)  # V1.1 - Multi-location tokens
+        print(config.LOCATION_TOKEN_MAP) 
     """
     
     def __init__(self):
@@ -70,13 +70,12 @@ class Config:
     
     def _load_production_database_config(self):
         """
-        Load production (AWS RDS) database configuration.
-        
-        Supports two naming conventions:
+        Load production database configuration.
+   
         1. Prefixed: PROD_DB_HOST, PROD_DB_NAME, etc.
         2. Non-prefixed: DB_HOST, DB_NAME, etc.
         
-        Tries prefixed first, falls back to non-prefixed.
+        PROD-prefixed variables take precedence if both are set.
         """
         self.DB_HOST = os.getenv('PROD_DB_HOST') or os.getenv('DB_HOST')
         self.DB_PORT = int(os.getenv('PROD_DB_PORT') or os.getenv('DB_PORT', '5432'))
@@ -95,7 +94,7 @@ class Config:
             env: Either 'LOCAL' or 'PROD'
         
         Raises:
-            ValueError: If any required configuration is missing
+            ValueError: If any required env missing
         """
         missing = []
         
@@ -119,7 +118,6 @@ class Config:
         """
         Load Square API configuration.
         
-        V1.1 Changes:
         - Loads location-specific tokens (SQUARE_ACCESS_TOKEN_WRIGLEYVILLE, etc.)
         - Creates LOCATION_TOKEN_MAP for multi-location support
         - Backwards compatible (location tokens are optional)
@@ -136,7 +134,7 @@ class Config:
         # Base URL
         self.SQUARE_API_BASE_URL: str = "https://connect.squareup.com/v2"
         
-        # V1.1: Load location-specific tokens (optional)
+        # load secundary locations 
         token_wrigleyville = os.getenv('SQUARE_ACCESS_TOKEN_WRIGLEYVILLE')
         token_southport = os.getenv('SQUARE_ACCESS_TOKEN_SOUTHPORT')
         
@@ -207,8 +205,9 @@ class Config:
 
 
 # Singleton instance
-config = Config()
-
+config = Config() # Single instance for app-wide use or "pythonic singleton"
+# be aware 
+# from app.utils.config import config  ✅ CORRECT (Singleton)
 
 # ============================================================================
 # TESTING

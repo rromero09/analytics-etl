@@ -6,7 +6,7 @@ This module handles all date/time operations for the ETL
 - Date component extraction (month, day_of_week, time)
 - Date range calculations for monthly ETL runs
 
-WHY THIS EXISTS:
+CONTEXT:
 - Square API returns timestamps in UTC (ISO 8601 format) more specifically rfc3339 that
 uses a subset of ISO 8601 and has  T as the date-time separator
 - Business operates in Chicago timezone (CST/CDT)
@@ -35,7 +35,6 @@ def convert_utc_to_chicago(utc_timestamp: str) -> datetime:
         utc_timestamp (str): ISO 8601 timestamp from Square API
             Examples: 
             - "2025-11-07T13:27:45.163Z"
-            - "2025-01-15T18:30:00Z"
     
     Returns:
         datetime: Timezone-aware datetime object in Chicago timezone
@@ -45,27 +44,16 @@ def convert_utc_to_chicago(utc_timestamp: str) -> datetime:
         >>> chicago_time = convert_utc_to_chicago(utc_time)
         >>> print(chicago_time)
         2025-11-07 07:27:45.163000-06:00  # 6 hours behind UTC (CST)
-        
-        # In summer (CDT):
-        >>> utc_time = "2025-07-15T13:27:45Z"
-        >>> chicago_time = convert_utc_to_chicago(utc_time)
-        >>> print(chicago_time)
-        2025-07-15 08:27:45-05:00  # 5 hours behind UTC (CDT)
-    
-    Raises:
-        ValueError: If timestamp string is invalid or cannot be parsed
     """
     try:
   
         utc_dt = parser.isoparse(utc_timestamp)
         
-        # Step 2: Ensure the datetime is timezone-aware (has UTC info)
         # If no timezone in string, assume UTC
         if utc_dt.tzinfo is None:
             utc_dt = UTC_TZ.localize(utc_dt)
         
-        # Step 3: Convert to Chicago timezone
-        # astimezone() automatically handles DST transitions
+
         chicago_dt = utc_dt.astimezone(CHICAGO_TZ)
         
         return chicago_dt
@@ -73,7 +61,7 @@ def convert_utc_to_chicago(utc_timestamp: str) -> datetime:
     except (ValueError, TypeError) as e:
         raise ValueError(
             f"Failed to convert timestamp '{utc_timestamp}' to Chicago time. "
-            f"Expected ISO 8601 format (e.g., '2025-11-07T13:27:45Z'). "
+            f"Expected ISO 8601 format. "
             f"Error: {str(e)}"
         )
 
@@ -81,14 +69,6 @@ def convert_utc_to_chicago(utc_timestamp: str) -> datetime:
 def extract_date_components(chicago_dt: datetime) -> Tuple[str, str, time]:
     """
     Extract month, day_of_week, and time from a Chicago timezone datetime.
-    
-    These components are stored separately in the database for efficient
-    querying and aggregation in Tableau.
-    
-    WHY WE EXTRACT THESE:
-    - month: For monthly sales reports and trends
-    - day_of_week: For day-of-week analysis (e.g., "Sundays are busiest")
-    - created_time: For intraday patterns (e.g., "lunch rush at noon")
     
     Args:
         chicago_dt (datetime): Timezone-aware datetime in Chicago timezone
@@ -100,8 +80,6 @@ def extract_date_components(chicago_dt: datetime) -> Tuple[str, str, time]:
             - created_time: Time only (HH:MM:SS)
     
     Example:
-        >>> from datetime import datetime
-        >>> import pytz
         >>> dt = datetime(2025, 11, 7, 13, 27, 45, tzinfo=pytz.timezone('America/Chicago'))
         >>> month, day, time_only = extract_date_components(dt)
         >>> print(month)
@@ -115,9 +93,6 @@ def extract_date_components(chicago_dt: datetime) -> Tuple[str, str, time]:
     # This format sorts correctly and is easy to filter in SQL
     month = chicago_dt.strftime('%Y-%m')
     
-    # Extract full weekday name
-    # strftime('%A') returns full name ('Monday', 'Tuesday', etc.)
-    # Alternative: strftime('%a') for abbreviation ('Mon', 'Tue')
     day_of_week = chicago_dt.strftime('%A')
     
     # Extract time only (without date information)
@@ -182,9 +157,7 @@ def calculate_previous_month_range() -> Tuple[str, str]:
 
 def format_for_square_api(date_str: str, is_start: bool = True) -> str:
     """
-    Format a date string for Square API datetime filter.
-    
-    Square API requires ISO 8601 timestamps with timezone info.
+
     This function converts simple dates (YYYY-MM-DD) to the format
     Square expects.
     
@@ -259,12 +232,6 @@ def validate_date_range(start_date: str, end_date: str) -> bool:
     Returns:
         bool: True if valid, False otherwise
     
-    Example:
-        >>> validate_date_range('2025-10-01', '2025-10-31')
-        True
-        
-        >>> validate_date_range('2025-10-31', '2025-10-01')
-        False
     """
     try:
         start = datetime.strptime(start_date, '%Y-%m-%d')
